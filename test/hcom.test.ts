@@ -271,6 +271,10 @@ test('isJammedTerminal과 clearJammedInput은 미제출 hcom 입력만 Ctrl+U/Ct
   assert.equal(isJammedTerminal({ ready: false, promptEmpty: false, inputText: '<hcom>[request #6]', lines: ['>'] }, 8), false);
   assert.equal(isJammedTerminal({ ready: false, promptEmpty: false, inputText: '<hcom>[request #6]', lines: ['● Running', 'esc to cancel'] }, 6), false);
   assert.equal(isJammedTerminal({ ready: false, promptEmpty: false, inputText: 'draft', lines: ['> <hcom>[request #6]', '> draft'] }, 6), false);
+  const repeated = '  worker</hcom><hcom>[request #6] codex -> worker</hcom>';
+  const wrapped = [repeated, '────', '? for shortcuts', ...Array<string>(24).fill('')];
+  assert.equal(isJammedTerminal({ ready: true, promptEmpty: false, inputText: '<hcom>[request #1]', lines: wrapped, cursorRow: 0 }, 6), true);
+  assert.equal(isJammedTerminal({ ready: true, promptEmpty: true, inputText: '', lines: [repeated, ...wrapped] }, 6), true);
 
   const calls: string[][] = [];
   let jammed: 'input' | 'frame' | 'resumed' | 'idle' = 'input';

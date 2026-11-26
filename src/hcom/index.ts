@@ -337,11 +337,11 @@ export function isJammedTerminal(term: TerminalState, requestId: number): boolea
   if (input?.startsWith(marker) && term.promptEmpty !== true) return true;
   // agy 재개 시 hcom은 이전 대화의 입력을 읽고, 실제 커서는 새 요청 위에 있을 수 있다.
   const cursorLine = term.cursorRow === undefined ? undefined : term.lines[term.cursorRow];
-  if (cursorLine?.trim().startsWith(marker)) return true;
+  if (cursorLine?.includes(marker)) return true;
   if (input) return false;
   if (term.promptEmpty === true) {
     if (!term.ready || typeof term.inputText !== 'string') return false;
-    const bottom = term.lines.slice(-14).join('\n');
+    const bottom = term.lines.filter(line => line.trim()).slice(-14).join('\n');
     const first = bottom.indexOf(marker);
     return first !== -1 && bottom.indexOf(marker, first + marker.length) !== -1;
   }
