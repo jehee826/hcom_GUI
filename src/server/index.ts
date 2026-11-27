@@ -46,9 +46,9 @@ function isAllowedOrigin(origin: string | undefined): boolean {
 function statusCodeForError(error: unknown): number {
   const message = error instanceof Error ? error.message : String(error);
   if (/등록되지 않은|찾을 수 없습니다/.test(message)) return 404;
-  if (/이미 같은 Git 저장소|진행 중인/.test(message)) return 409;
+  if (/이미 같은 (?:Git 저장소|프로젝트 폴더)|진행 중인|답변 대기 상태가 아닌/.test(message)) return 409;
   if (/다른 프로젝트|다른 Git 저장소|재사용할 수 없습니다|프로젝트 밖/.test(message)) return 403;
-  if (/필요합니다|비어 있습니다|절대 경로|상대 경로|유효하지 않은/.test(message)) return 400;
+  if (/필요합니다|비어 있습니다|절대 경로|상대 경로|유효하지 않은|지원하지 않습니다/.test(message)) return 400;
   return 500;
 }
 
@@ -224,6 +224,31 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
     }
   });
 
+  app.post('/api/projects/:projectId/workers/:workerId/messages', (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const workerId = paramString(req.params.workerId);
+      const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+      const requestId = typeof body.requestId === 'string' ? body.requestId.trim() : '';
+      const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+      if (!requestId || !prompt) {
+        res.status(400).json({ error: 'requestId와 prompt가 필요합니다.' });
+        return;
+      }
+      const existing = manager.getRequest(projectId, requestId);
+      if (existing) {
+        res.status(200).json({ request: existing, deduplicated: true });
+        return;
+      }
+      const runPromise = manager.sendDirectWorkerMessage(projectId, workerId, requestId, prompt);
+      runPromise.catch(() => {});
+      const accepted = manager.getRequest(projectId, requestId);
+      res.status(202).json({ request: accepted, deduplicated: false });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
   app.post('/api/projects/:projectId/worktree', async (req, res) => {
     try {
       const projectId = paramString(req.params.projectId);
@@ -281,6 +306,65 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
       }
       const delegations = manager.listDelegations(projectId, requestId);
       res.json({ request, delegations });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  app.post('/api/projects/:projectId/requests/:requestId/reply', (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const requestId = paramString(req.params.requestId);
+      const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+      const replyKey = typeof body.replyKey === 'string' ? body.replyKey.trim() : '';
+      const answer = typeof body.answer === 'string' ? body.answer.trim() : '';
+      if (!replyKey || !answer) {
+        res.status(400).json({ error: 'replyKey와 답변 내용(answer)이 필요합니다.' });
+        return;
+      }
+      const existing = manager.getRequest(projectId, requestId);
+      if (!existing) {
+        res.status(404).json({ error: '요청을 찾을 수 없습니다.' });
+        return;
+      }
+      if (existing.userReplies.some(entry => entry.replyKey === replyKey)) {
+        res.status(200).json({ request: existing, deduplicated: true });
+        return;
+      }
+      if (existing.status !== 'waiting_user') {
+        res.status(409).json({ error: `사용자 답변 대기 상태가 아닌 요청입니다 (${existing.status}).` });
+        return;
+      }
+      const runPromise = manager.replyToRequest(projectId, requestId, replyKey, answer);
+      runPromise.catch(() => {});
+      const updated = manager.getRequest(projectId, requestId);
+      res.status(202).json({ request: updated, deduplicated: false });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  app.post('/api/projects/:projectId/requests/:requestId/cancel', async (req, res) => {
+    try {
+      const request = await manager.cancelRequest(paramString(req.params.projectId), paramString(req.params.requestId));
+      res.json({ request });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  app.post('/api/projects/:projectId/requests/:requestId/resume', (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const requestId = paramString(req.params.requestId);
+      const existing = manager.getRequest(projectId, requestId);
+      if (!existing) {
+        res.status(404).json({ error: '요청을 찾을 수 없습니다.' });
+        return;
+      }
+      const runPromise = manager.resumePendingRequest(projectId, requestId);
+      runPromise.catch(() => {});
+      res.status(202).json({ request: existing });
     } catch (error) {
       sendError(res, error);
     }

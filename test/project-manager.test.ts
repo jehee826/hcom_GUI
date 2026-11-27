@@ -338,7 +338,7 @@ test('2단계 전체 격리: A·B 동시 실행, 교차 거절, 추가 워커, �
     // 1. A·B 등록 및 중복 worktree 등록 거절
     const snapA = manager.registerProject('C:\\repos\\a', { name: 'Project A' });
     const snapB = manager.registerProject('C:\\repos\\b', { name: 'Project B' });
-    assert.throws(() => manager.registerProject('C:\\repos\\a-wt'), /이미 같은 Git 저장소/);
+    assert.throws(() => manager.registerProject('C:\\repos\\a-wt'), /이미 같은 프로젝트 폴더/);
     assert.notEqual(snapA.project.projectId, snapB.project.projectId);
     assert.notEqual(snapA.project.hcomDir, snapB.project.hcomDir);
 

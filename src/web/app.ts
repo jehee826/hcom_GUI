@@ -68,13 +68,26 @@ interface ProjectSnapshot {
   selected: boolean;
 }
 
+interface UserReplyEntry {
+  replyKey: string;
+  question: string;
+  answer: string;
+  createdAt: string;
+}
+
 interface RequestRecord {
   projectId: string;
   requestId: string;
+  mode: 'codex' | 'direct_worker';
+  targetWorkerId: string | null;
   prompt: string;
   status: string;
+  round: number;
   codexTurnId: string | null;
   reviewTurnId: string | null;
+  pendingQuestion: string | null;
+  pendingQuestionOptions: string[];
+  userReplies: UserReplyEntry[];
   finalText: string | null;
   error: string | null;
 }
@@ -83,10 +96,12 @@ interface DelegationRecord {
   delegationId: string;
   requestId: string;
   workerId: string;
+  round: number;
   requestEventId: number | null;
   replyEventId: number | null;
   prompt: string;
   replyText: string | null;
+  summaryText: string | null;
   status: string;
 }
 
@@ -151,11 +166,14 @@ function statusLabel(status: string): string {
     disconnected: '연결 끊김',
     error: '오류',
     accepted: '접수',
-    codex_running: 'Codex 실행',
+    codex_running: 'Codex 판단',
     worker_working: '워커 작업 중',
-    codex_reviewing: 'Codex 검토',
+    codex_reviewing: 'Codex 검수',
+    waiting_user: '사용자 답변 대기',
     completed: '완료',
     failed: '실패',
+    timed_out: '시간 초과',
+    cancelled: '취소됨',
     interrupted: '중단',
     needs_verification: '확인 필요',
   };
@@ -292,6 +310,7 @@ function renderHeaderAndBar(): void {
   const hcomStrip = el<HTMLElement>('hcomStrip');
   const input = el<HTMLTextAreaElement>('promptInput');
   const sendBtn = el<HTMLButtonElement>('sendBtn');
+  const targetSelect = el<HTMLSelectElement>('composerTargetSelect');
   const targetTag = el<HTMLSpanElement>('targetProjectTag');
   const hint = el<HTMLSpanElement>('composerHint');
   const addWorkerBtn = el<HTMLButtonElement>('openAddWorkerBtn');
@@ -307,6 +326,7 @@ function renderHeaderAndBar(): void {
     hcomStrip.classList.add('hidden');
     input.disabled = true;
     sendBtn.disabled = true;
+    targetSelect.disabled = true;
     targetTag.classList.add('hidden');
     hint.textContent = '프로젝트를 먼저 선택하세요';
     addWorkerBtn.disabled = true;
@@ -314,7 +334,7 @@ function renderHeaderAndBar(): void {
     return;
   }
 
-  const { project, codex, handoff } = detail.snapshot;
+  const { project, codex, handoff, workers } = detail.snapshot;
   headerName.textContent = project.name;
   branchBadge.textContent = handoff.branchStatus;
   branchBadge.classList.remove('hidden');
@@ -344,27 +364,61 @@ function renderHeaderAndBar(): void {
   feed.classList.remove('hidden');
   hcomStrip.classList.remove('hidden');
 
+  const prevTarget = targetSelect.value || 'codex';
+  clearChildren(targetSelect);
+  const codexOpt = document.createElement('option');
+  codexOpt.value = 'codex';
+  codexOpt.textContent = 'Codex (오케스트레이터)';
+  targetSelect.appendChild(codexOpt);
+  for (const w of workers) {
+    const opt = document.createElement('option');
+    opt.value = `worker:${w.workerId}`;
+    opt.textContent = `직접 전송 · ${w.name}`;
+    targetSelect.appendChild(opt);
+  }
+  const hasPrev = [...targetSelect.options].some(o => o.value === prevTarget);
+  targetSelect.value = hasPrev ? prevTarget : 'codex';
+  targetSelect.disabled = false;
+
   input.disabled = false;
   sendBtn.disabled = false;
   targetTag.textContent = `대상: ${project.name}`;
   targetTag.classList.remove('hidden');
-  hint.textContent = 'Enter 전송 · Shift+Enter 줄바꿈 · 프로젝트별 독립 세션';
+  hint.textContent = targetSelect.value === 'codex'
+    ? 'Enter 전송 · Shift+Enter 줄바꿈 · Codex 검수/재지시 자동 연결'
+    : 'Enter 전송 · 선택한 워커에게 hcom으로 직접 메시지 전송';
   addWorkerBtn.disabled = false;
   saveHandoffBtn.disabled = false;
 }
 
-function renderPipeline(status: string): HTMLElement {
-  const steps: Array<[string, string]> = [
-    ['accepted', '접수'],
-    ['codex_running', 'Codex 실행'],
-    ['worker_working', '워커 작업 중'],
-    ['codex_reviewing', 'Codex 검토'],
-    ['completed', '완료'],
-  ];
-  const order = steps.map(([key]) => key);
-  const currentIdx = order.indexOf(status);
+function renderPipeline(req: RequestRecord): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'stage-pipeline';
+
+  if (req.mode === 'direct_worker') {
+    const directTag = document.createElement('span');
+    directTag.className = 'stage-step done';
+    directTag.textContent = '워커 직접 전송';
+    wrap.appendChild(directTag);
+  }
+
+  const roundSuffix = req.round > 1 ? ` · ${req.round}차` : '';
+  const steps: Array<[string, string]> = req.mode === 'direct_worker'
+    ? [
+      ['accepted', '접수'],
+      ['worker_working', '워커 작업 중'],
+      ['completed', '완료'],
+    ]
+    : [
+      ['accepted', '접수'],
+      ['codex_running', 'Codex 판단'],
+      ['worker_working', `워커 작업 중${roundSuffix}`],
+      ['codex_reviewing', `Codex 검수${roundSuffix}`],
+      ['completed', '완료'],
+    ];
+
+  const order = steps.map(([key]) => key);
+  const currentIdx = order.indexOf(req.status);
   for (let i = 0; i < steps.length; i++) {
     const [, label] = steps[i]!;
     const span = document.createElement('span');
@@ -376,10 +430,18 @@ function renderPipeline(status: string): HTMLElement {
     span.textContent = label;
     wrap.appendChild(span);
   }
+
   if (currentIdx < 0) {
     const badge = document.createElement('span');
-    badge.className = 'stage-step current';
-    badge.textContent = statusLabel(status);
+    const variant = req.status === 'waiting_user'
+      ? 'waiting'
+      : req.status === 'timed_out'
+        ? 'timeout'
+        : req.status === 'cancelled'
+          ? 'cancelled'
+          : 'failed';
+    badge.className = `stage-step ${variant}`;
+    badge.textContent = statusLabel(req.status);
     wrap.appendChild(badge);
   }
   return wrap;
@@ -404,6 +466,7 @@ function renderMessages(): void {
     return;
   }
 
+  const projectId = detail.snapshot.project.projectId;
   const workerById = new Map(detail.snapshot.workers.map(w => [w.workerId, w]));
   for (const req of detail.requests) {
     const group = document.createElement('div');
@@ -419,11 +482,23 @@ function renderMessages(): void {
 
     const header = document.createElement('div');
     header.className = 'assistant-header';
-    header.appendChild(renderPipeline(req.status));
+    header.appendChild(renderPipeline(req));
+    const rightMeta = document.createElement('div');
+    rightMeta.className = 'assistant-header-right';
+    const isCancellable = ['accepted', 'codex_running', 'worker_working', 'codex_reviewing', 'waiting_user'].includes(req.status);
+    if (isCancellable) {
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'btn btn-subtle btn-xs';
+      cancelBtn.type = 'button';
+      cancelBtn.textContent = '취소';
+      cancelBtn.addEventListener('click', () => { void handleCancelRequest(projectId, req.requestId); });
+      rightMeta.appendChild(cancelBtn);
+    }
     const reqTag = document.createElement('span');
     reqTag.className = 'mono-text muted-text';
     reqTag.textContent = shortId(req.requestId);
-    header.appendChild(reqTag);
+    rightMeta.appendChild(reqTag);
+    header.appendChild(rightMeta);
     card.appendChild(header);
 
     const reqDelegations = detail.delegations.filter(d => d.requestId === req.requestId);
@@ -434,7 +509,7 @@ function renderMessages(): void {
       const title = document.createElement('div');
       title.className = 'delegation-title';
       const left = document.createElement('span');
-      left.textContent = `hcom 위임 → ${worker?.name ?? shortId(del.workerId)}`;
+      left.textContent = `hcom ${req.mode === 'direct_worker' ? '직접 전달' : `위임 ${del.round}차`} → ${worker?.name ?? shortId(del.workerId)}`;
       const right = document.createElement('span');
       right.className = 'mono-text';
       right.textContent = `요청 #${del.requestEventId ?? '-'}${del.replyEventId ? ` · 회신 #${del.replyEventId}` : ''}`;
@@ -443,12 +518,76 @@ function renderMessages(): void {
 
       const reply = document.createElement('div');
       reply.className = 'delegation-reply';
-      reply.textContent = del.replyText ? del.replyText : '워커 회신 대기 중...';
+      reply.textContent = del.replyText
+        ? del.replyText
+        : del.status === 'cancelled'
+          ? '취소된 작업입니다.'
+          : del.status === 'timed_out'
+            ? '워커 회신 시간이 초과되었습니다.'
+            : '워커 회신 대기 중...';
       box.appendChild(reply);
       card.appendChild(box);
     }
 
-    if (req.finalText) {
+    for (const entry of req.userReplies) {
+      const note = document.createElement('div');
+      note.className = 'user-reply-note';
+      note.textContent = `Q. ${entry.question}\nA. ${entry.answer}`;
+      card.appendChild(note);
+    }
+
+    if (req.status === 'waiting_user' && req.pendingQuestion) {
+      const qBox = document.createElement('div');
+      qBox.className = 'question-box';
+      const qTitle = document.createElement('div');
+      qTitle.className = 'question-title';
+      qTitle.textContent = '사용자 판단 필요 · 답변하면 같은 요청에서 이어집니다';
+      const qText = document.createElement('div');
+      qText.className = 'question-text';
+      qText.textContent = req.pendingQuestion;
+      qBox.append(qTitle, qText);
+
+      if (req.pendingQuestionOptions.length > 0) {
+        const optWrap = document.createElement('div');
+        optWrap.className = 'question-options';
+        for (const opt of req.pendingQuestionOptions) {
+          const optBtn = document.createElement('button');
+          optBtn.className = 'btn btn-outline btn-xs';
+          optBtn.type = 'button';
+          optBtn.textContent = opt;
+          optBtn.addEventListener('click', () => { void handleReplyToRequest(projectId, req.requestId, opt); });
+          optWrap.appendChild(optBtn);
+        }
+        qBox.appendChild(optWrap);
+      }
+
+      const replyRow = document.createElement('div');
+      replyRow.className = 'question-reply-row';
+      const replyInput = document.createElement('input');
+      replyInput.className = 'input';
+      replyInput.type = 'text';
+      replyInput.placeholder = '판단 내용을 입력하고 Enter 또는 버튼을 누르세요';
+      const replyBtn = document.createElement('button');
+      replyBtn.className = 'btn btn-primary btn-xs';
+      replyBtn.type = 'button';
+      replyBtn.textContent = '답변하고 계속';
+      const submitAnswer = () => {
+        const ans = replyInput.value.trim();
+        if (!ans) return;
+        replyInput.value = '';
+        void handleReplyToRequest(projectId, req.requestId, ans);
+      };
+      replyBtn.addEventListener('click', submitAnswer);
+      replyInput.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && !event.isComposing) {
+          event.preventDefault();
+          submitAnswer();
+        }
+      });
+      replyRow.append(replyInput, replyBtn);
+      qBox.appendChild(replyRow);
+      card.appendChild(qBox);
+    } else if (req.finalText) {
       const body = document.createElement('div');
       body.className = 'assistant-body';
       body.textContent = req.finalText;
@@ -456,7 +595,7 @@ function renderMessages(): void {
     } else if (req.error) {
       const err = document.createElement('div');
       err.className = 'assistant-error';
-      err.textContent = req.error;
+      err.textContent = `[${statusLabel(req.status)}] ${req.error}`;
       card.appendChild(err);
     } else {
       const pending = document.createElement('div');
@@ -645,6 +784,9 @@ function connectSse(projectId: string, afterSeq: number): void {
     'request.codex_running',
     'request.worker_working',
     'request.codex_reviewing',
+    'request.waiting_user',
+    'request.user_replied',
+    'request.cancelled',
     'request.finished',
     'request.failed',
     'handoff.updated',
@@ -757,14 +899,50 @@ async function handleSendPrompt(): Promise<void> {
   const prompt = input.value.trim();
   if (!prompt) return;
 
+  const target = el<HTMLSelectElement>('composerTargetSelect').value || 'codex';
   const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   input.value = '';
   try {
     showNotice(null);
-    await api(`/api/projects/${encodeURIComponent(projectId)}/requests`, {
+    if (target.startsWith('worker:')) {
+      const workerId = target.slice('worker:'.length);
+      await api(`/api/projects/${encodeURIComponent(projectId)}/workers/${encodeURIComponent(workerId)}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ requestId, prompt }),
+      });
+    } else {
+      await api(`/api/projects/${encodeURIComponent(projectId)}/requests`, {
+        method: 'POST',
+        body: JSON.stringify({ requestId, prompt }),
+      });
+    }
+    await refreshActiveProject(projectId, false);
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function handleReplyToRequest(projectId: string, requestId: string, answer: string): Promise<void> {
+  const replyKey = `reply-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    showNotice(null);
+    await api(`/api/projects/${encodeURIComponent(projectId)}/requests/${encodeURIComponent(requestId)}/reply`, {
       method: 'POST',
-      body: JSON.stringify({ requestId, prompt }),
+      body: JSON.stringify({ replyKey, answer }),
     });
+    await refreshActiveProject(projectId, false);
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function handleCancelRequest(projectId: string, requestId: string): Promise<void> {
+  try {
+    showNotice('요청을 취소하는 중입니다...');
+    await api(`/api/projects/${encodeURIComponent(projectId)}/requests/${encodeURIComponent(requestId)}/cancel`, {
+      method: 'POST',
+    });
+    showNotice(null);
     await refreshActiveProject(projectId, false);
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error), true);
@@ -922,6 +1100,9 @@ function bindEvents(): void {
       event.preventDefault();
       void handleSendPrompt();
     }
+  });
+  el<HTMLSelectElement>('composerTargetSelect').addEventListener('change', () => {
+    renderHeaderAndBar();
   });
   el<HTMLButtonElement>('sendBtn').addEventListener('click', () => { void handleSendPrompt(); });
 

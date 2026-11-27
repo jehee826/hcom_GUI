@@ -94,8 +94,8 @@
                 </svg>
               </div>
               <h1>프로젝트별 격리 AI 세션 워크스페이스</h1>
-              <p>로컬 Git 프로젝트를 등록하면 프로젝트마다 독립된 <code>HCOM_DIR</code>, Codex 스레드, Antigravity 워커 세션이 분리되어 실행됩니다.</p>
-              <button id="emptyRegisterBtn" class="btn btn-primary">로컬 Git 프로젝트 등록</button>
+              <p>로컬 폴더(Git 저장소 또는 일반 폴더)를 등록하면 프로젝트마다 독립된 <code>HCOM_DIR</code>, Codex 스레드, Antigravity 워커 세션이 분리되어 실행됩니다.</p>
+              <button id="emptyRegisterBtn" class="btn btn-primary">로컬 프로젝트 폴더 등록</button>
             </div>
           </div>
           <div id="messageFeed" class="message-feed hidden"></div>
@@ -121,6 +121,9 @@
             <div class="composer-footer">
               <span id="composerHint" class="composer-hint">프로젝트를 먼저 선택하세요</span>
               <div class="composer-actions">
+                <select id="composerTargetSelect" class="target-select" title="메시지 전송 대상" disabled>
+                  <option value="codex">Codex (오케스트레이터)</option>
+                </select>
                 <span id="targetProjectTag" class="target-tag hidden"></span>
                 <button id="sendBtn" class="btn btn-primary btn-sm" disabled>전송</button>
               </div>
@@ -184,14 +187,14 @@
   <div id="registerModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-header">
-        <h2>로컬 Git 프로젝트 등록</h2>
+        <h2>로컬 프로젝트 폴더 등록</h2>
         <button class="icon-btn modal-close" data-close="registerModal" aria-label="닫기">×</button>
       </div>
       <div class="modal-body">
         <label class="field">
-          <span class="field-label">Git 폴더 절대 경로</span>
+          <span class="field-label">프로젝트 폴더 절대 경로 (Git 저장소 · 일반 폴더 모두 가능)</span>
           <div class="input-row">
-            <input id="registerPathInput" class="input mono-text" type="text" placeholder="C:\Users\...\my-repo" />
+            <input id="registerPathInput" class="input mono-text" type="text" placeholder="C:\Users\...\my-project" />
             <button id="browseFolderBtn" class="btn btn-outline btn-sm" type="button">폴더 선택</button>
           </div>
         </label>
