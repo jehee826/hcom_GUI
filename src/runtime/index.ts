@@ -166,6 +166,7 @@ export class ProjectManager {
   private readonly createHcom: (scope: ProjectScope) => HcomClient;
   private readonly locks = new KeyedLock();
   private readonly runtimes = new Map<string, ProjectRuntime>();
+  private readonly eventSubscribers = new Set<(event: ProjectEventRecord) => void>();
 
   constructor(options: ProjectManagerOptions) {
     this.dataDir = options.dataDir;
@@ -198,7 +199,7 @@ export class ProjectManager {
       defaultWorkerName: options?.defaultWorkerName,
     });
     if (!this.store.getSelectedProjectId()) this.store.selectProject(created.project.projectId);
-    this.store.appendEvent(created.project.projectId, 'project.registered', { rootPath: info.rootPath });
+    this.emitEvent(created.project.projectId, 'project.registered', { rootPath: info.rootPath });
     return this.getProjectSnapshot(created.project.projectId);
   }
 
@@ -248,7 +249,7 @@ export class ProjectManager {
       ...(patch.testResult !== undefined ? { testResult: patch.testResult } : {}),
       ...(patch.nextSteps !== undefined ? { nextSteps: patch.nextSteps } : {}),
     });
-    this.store.appendEvent(projectId, 'handoff.updated', { updatedAt: updated.updatedAt });
+    this.emitEvent(projectId, 'handoff.updated', { updatedAt: updated.updatedAt });
     return updated;
   }
 
@@ -260,6 +261,34 @@ export class ProjectManager {
       branchStatus: snap.branchStatus,
       commitStatus: snap.commitStatus,
     });
+  }
+
+  subscribeEvents(listener: (event: ProjectEventRecord) => void): () => void {
+    this.eventSubscribers.add(listener);
+    return () => { this.eventSubscribers.delete(listener); };
+  }
+
+  private emitEvent(projectId: string, kind: string, payload: Record<string, unknown>): ProjectEventRecord {
+    const saved = this.store.appendEvent(projectId, kind, payload);
+    for (const listener of this.eventSubscribers) {
+      try { listener(saved); } catch {}
+    }
+    return saved;
+  }
+
+  listRequests(projectId: string): RequestRecord[] {
+    this.requireProject(projectId);
+    return this.store.listRequests(projectId);
+  }
+
+  getRequest(projectId: string, requestId: string): RequestRecord | undefined {
+    this.requireProject(projectId);
+    return this.store.getRequest(projectId, requestId);
+  }
+
+  listDelegations(projectId: string, requestId?: string): DelegationRecord[] {
+    this.requireProject(projectId);
+    return this.store.listDelegations(projectId, requestId);
   }
 
   listProjectEvents(projectId: string, afterSeq = 0): ProjectEventRecord[] {
@@ -306,7 +335,7 @@ export class ProjectManager {
         cwd: targetCwd,
       });
       if (created) {
-        this.store.appendEvent(projectId, 'worker.added', { workerId: worker.workerId, name: worker.name, cwd: worker.cwd });
+        this.emitEvent(projectId, 'worker.added', { workerId: worker.workerId, name: worker.name, cwd: worker.cwd });
       }
       if (input.start !== false) {
         return this.startWorker(projectId, worker.workerId);
@@ -424,7 +453,7 @@ export class ProjectManager {
         status: 'ready',
         lastError: null,
       });
-      this.store.appendEvent(projectId, 'worker.started', { workerId, hcomName: launch.name, conversationId });
+      this.emitEvent(projectId, 'worker.started', { workerId, hcomName: launch.name, conversationId });
       return updated;
     });
   }
@@ -453,7 +482,7 @@ export class ProjectManager {
       runtime.bindings.delete(workerId);
       runtime.launches.delete(workerId);
       const updated = this.store.updateWorker(projectId, workerId, { status: 'stopped', lastError: null });
-      this.store.appendEvent(projectId, 'worker.stopped', { workerId, hcomName: worker.hcomName, conversationId: worker.conversationId });
+      this.emitEvent(projectId, 'worker.stopped', { workerId, hcomName: worker.hcomName, conversationId: worker.conversationId });
       return updated;
     });
   }
@@ -498,7 +527,7 @@ export class ProjectManager {
           runtime.codexCwd = nextCwd;
           this.store.updateCodexSession(projectId, { cwd: nextCwd, status: 'ready', lastError: null });
           this.refreshHandoffGitState(projectId, nextCwd);
-          this.store.appendEvent(projectId, 'codex.worktree_switched', { cwd: nextCwd, threadId: current.threadId });
+          this.emitEvent(projectId, 'codex.worktree_switched', { cwd: nextCwd, threadId: current.threadId });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           this.store.updateCodexSession(projectId, { cwd: prevCwd, status: 'needs_attention', lastError: `worktree 전환 실패: ${message}` });
@@ -522,7 +551,7 @@ export class ProjectManager {
           throw new Error('워커의 초기 대화가 바인딩된 뒤 작업 경로를 변경할 수 있습니다.');
         }
         this.store.updateWorker(projectId, workerId, { cwd: nextCwd, lastError: null });
-        this.store.appendEvent(projectId, 'worker.worktree_switched', { workerId, cwd: nextCwd, conversationId: null });
+        this.emitEvent(projectId, 'worker.worktree_switched', { workerId, cwd: nextCwd, conversationId: null });
         return;
       }
 
@@ -561,7 +590,7 @@ export class ProjectManager {
         const verified = await runtime.hcom.verifyResumedWorker(binding, nextCwd);
         runtime.bindings.set(workerId, verified);
         this.store.updateWorker(projectId, workerId, { cwd: nextCwd, status: 'ready', lastError: null });
-        this.store.appendEvent(projectId, 'worker.worktree_switched', { workerId, cwd: nextCwd, conversationId: worker.conversationId });
+        this.emitEvent(projectId, 'worker.worktree_switched', { workerId, cwd: nextCwd, conversationId: worker.conversationId });
       } catch (error) {
         if (launch) {
           await runtime.hcom.stopWorkerByName(launch.name, worker.conversationId, null).catch(() => {});
@@ -610,13 +639,14 @@ export class ProjectManager {
     this.requireProject(projectId);
     const accepted = this.store.acceptRequest({ projectId, requestId, prompt });
     if (!accepted.created) return accepted.request;
+    this.emitEvent(projectId, 'request.accepted', { requestId, prompt });
 
     return this.locks.run(`request:${projectId}`, async () => {
       const runtime = await this.ensureRuntime(projectId);
       const codex = await this.ensureCodexSession(projectId);
       this.store.updateRequest(projectId, requestId, { status: 'codex_running' });
       this.store.updateCodexSession(projectId, { status: 'running', lastError: null });
-      this.store.appendEvent(projectId, 'request.codex_running', { requestId });
+      this.emitEvent(projectId, 'request.codex_running', { requestId });
       runtime.activeRequest = { requestId };
 
       try {
@@ -636,7 +666,7 @@ export class ProjectManager {
             error: firstTurn.reason ?? null,
           });
           this.store.updateCodexSession(projectId, { status: 'ready' });
-          this.store.appendEvent(projectId, 'request.finished', { requestId, status: record.status, finalText: record.finalText });
+          this.emitEvent(projectId, 'request.finished', { requestId, status: record.status, finalText: record.finalText });
           return record;
         }
 
@@ -647,13 +677,15 @@ export class ProjectManager {
             error: firstTurn.reason ?? '위임 턴이 완료되지 않았습니다.',
           });
           this.store.updateCodexSession(projectId, { status: 'ready' });
+          this.emitEvent(projectId, 'request.finished', { requestId, status: record.status, error: record.error });
           return record;
         }
 
         this.store.updateRequest(projectId, requestId, { status: 'worker_working', codexTurnId: firstTurn.turnId });
-        this.store.appendEvent(projectId, 'request.worker_working', {
+        this.emitEvent(projectId, 'request.worker_working', {
           requestId,
           workerId: pending.worker.workerId,
+          workerName: pending.worker.name,
           requestEventId: pending.receipt.eventId,
         });
 
@@ -669,10 +701,12 @@ export class ProjectManager {
         });
         this.store.updateWorker(projectId, pending.worker.workerId, { status: 'ready', lastError: null });
         this.store.updateRequest(projectId, requestId, { status: 'codex_reviewing' });
-        this.store.appendEvent(projectId, 'request.codex_reviewing', {
+        this.emitEvent(projectId, 'request.codex_reviewing', {
           requestId,
           workerId: pending.worker.workerId,
+          workerName: pending.worker.name,
           replyEventId: reply.id,
+          replyText,
           conversationId: binding.sessionId,
         });
 
@@ -705,8 +739,9 @@ export class ProjectManager {
             lastWorkerReport: replyText,
             lastCodexReview: reviewTurn.finalText ?? null,
           });
+          this.emitEvent(projectId, 'handoff.updated', { requestId });
         }
-        this.store.appendEvent(projectId, 'request.finished', {
+        this.emitEvent(projectId, 'request.finished', {
           requestId,
           status: finalRecord.status,
           finalText: finalRecord.finalText,
@@ -717,7 +752,7 @@ export class ProjectManager {
         const status = /대기 상태/.test(message) ? 'needs_attention' : /확인/.test(message) ? 'needs_verification' : 'failed';
         this.store.updateRequest(projectId, requestId, { status, error: message });
         this.store.updateCodexSession(projectId, { status: status === 'needs_attention' ? 'needs_attention' : 'ready', lastError: message });
-        this.store.appendEvent(projectId, 'request.failed', { requestId, status, error: message });
+        this.emitEvent(projectId, 'request.failed', { requestId, status, error: message });
         throw error;
       } finally {
         runtime.activeRequest = undefined;
@@ -778,6 +813,7 @@ export class ProjectManager {
     }
 
     this.store.updateCodexSession(projectId, { status: 'stopped', lastError: null });
+    this.emitEvent(projectId, 'project.stopped', { projectId });
     this.runtimes.delete(projectId);
     if (errors.length) {
       throw new AggregateError(errors, `프로젝트 종료 정리 확인 필요 (${projectId})`);
@@ -888,13 +924,27 @@ export class ProjectManager {
         runtime.eventError = error;
         if (/DB가 교체/.test(error.message)) {
           this.store.markDbReset(projectId);
-          this.store.appendEvent(projectId, 'hcom.db_reset', { error: error.message });
+          this.emitEvent(projectId, 'hcom.db_reset', { error: error.message });
         }
       },
     );
   }
 
   private handleHcomEvent(projectId: string, event: HcomEvent): void {
+    if (event.type === 'message' && typeof event.data.from === 'string' && typeof event.data.text === 'string') {
+      const senderKind = typeof event.data.sender_kind === 'string' ? event.data.sender_kind : '';
+      if (senderKind === 'instance') {
+        this.emitEvent(projectId, 'hcom.message', {
+          eventId: event.id,
+          from: event.data.from,
+          intent: typeof event.data.intent === 'string' ? event.data.intent : null,
+          replyTo: typeof event.data.reply_to === 'string' ? event.data.reply_to : null,
+          deliveredTo: Array.isArray(event.data.delivered_to) ? event.data.delivered_to : [],
+          text: event.data.text,
+        });
+      }
+      return;
+    }
     if (event.type !== 'status' || !event.instance) return;
     const worker = this.store.findWorkerByHcomName(projectId, event.instance);
     if (!worker) return;
@@ -909,14 +959,22 @@ export class ProjectManager {
           status: 'needs_attention',
           lastError: '다른 프로젝트에 귀속된 대화 ID 충돌이 감지되었습니다.',
         });
+        this.emitEvent(projectId, 'worker.status', { workerId: worker.workerId, status: 'needs_attention' });
         return;
       }
     }
-    this.store.updateWorker(projectId, worker.workerId, {
+    const updated = this.store.updateWorker(projectId, worker.workerId, {
       status: mapped,
       ...(session && !worker.conversationId ? { conversationId: session } : {}),
       lastError: mapped === 'needs_attention' ? String(event.data.detail ?? event.data.context ?? 'blocked') : null,
     });
+    if (updated.status !== worker.status || updated.conversationId !== worker.conversationId) {
+      this.emitEvent(projectId, 'worker.status', {
+        workerId: worker.workerId,
+        status: updated.status,
+        conversationId: updated.conversationId,
+      });
+    }
   }
 
   private async reconcileRuntime(projectId: string, runtime: ProjectRuntime): Promise<void> {
@@ -1031,7 +1089,7 @@ export class ProjectManager {
           status: 'ready',
           lastError: null,
         });
-        this.store.appendEvent(projectId, 'codex.started', { threadId, hcomName: participant.name, cwd: codexRec.cwd });
+        this.emitEvent(projectId, 'codex.started', { threadId, hcomName: participant.name, cwd: codexRec.cwd });
         return client;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
