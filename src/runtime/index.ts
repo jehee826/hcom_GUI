@@ -1179,7 +1179,10 @@ export class ProjectManager {
         status: readyWorker.status,
       };
       this.store.updateWorker(projectId, readyWorker.workerId, { status: 'working', lastError: null });
-      const receipt = await runtime.hcom.send(sender, target, task);
+      const wireTask = /--intent\s+inform/i.test(task)
+        ? task
+        : `${task}\n\n[hcom 회신 규칙] 작업 완료 후 단순 접수(ack)가 아닌 최종 결과를 반드시 hcom send @${sender.name} --intent inform --reply-to <요청ID> 형식으로 회신하세요.`;
+      const receipt = await runtime.hcom.send(sender, target, wireTask);
       const delegation = this.store.createDelegation({
         projectId,
         requestId: active.requestId,
