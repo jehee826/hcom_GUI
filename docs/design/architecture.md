@@ -1,93 +1,87 @@
 # hcom_gui 요구사항과 아키텍처
 
-Windows 노트북에서 로컬 Git 프로젝트를 선택하면 그 프로젝트 전용 Codex와 Antigravity CLI(`agy`) 세션을 시작하거나 재개한다. 데스크톱과 폰은 같은 노트북 백엔드에 접속한다. 사용자는 Codex에 지시하고, Codex는 설계·작업 분배·검토를, 기본 및 추가 Antigravity 워커는 구현·테스트를 맡는다.
+Windows 노트북에서 로컬 프로젝트 폴더(Git 저장소 또는 일반 폴더)를 등록하면 프로젝트마다 독립된 `HCOM_DIR`, Codex App Server 스레드, 기본 및 추가 Antigravity CLI(`agy`) 워커 세션을 격리 실행·재개한다. 사용자는 Codex에 지시하거나 필요 시 개별 워커와 직접 대화하며, Codex는 설계·작업 분배·멀티라운드 검수·재지시를, Antigravity 워커는 구현·테스트를 맡는다.
 
-## 1. 요구사항과 화면
+## 1. 요구사항과 UI 구조
 
-### MVP
+### 핵심 기능
 
-| 요구사항 | 동작 |
+| 영역 | 동작 |
 | --- | --- |
-| 프로젝트 등록·격리 | 노트북에서 기존 로컬 Git 폴더를 등록하고 양쪽 화면에서 선택한다. 프로젝트마다 전용 Codex 스레드 하나와 기본 `agy` 워커 하나를 둔다. 세션·참가자 목록·메시지·기록은 소속 프로젝트에만 표시하고 전달한다. |
-| 시작·재개 | 첫 시작에는 새 대화 ID를 저장한다. 실행 중이면 기존 연결을 표시하고, 중지된 경우 저장된 ID로 재개한다. 프로젝트당 활성 Codex 하나, 기본·추가 워커 각각에 활성 세션 하나를 유지한다. 창 닫기, 프로젝트 전환, 폰 재접속은 실행 상태를 바꾸지 않는다. |
-| 지시·답변 | 선택된 프로젝트에 자연어를 보내고 Codex의 진행 상태와 답변을 본다. 프로젝트별 사용자 요청은 한 번에 하나를 진행한다. A와 B는 서로 독립적으로 동시에 진행할 수 있다. |
-| 워커 추가·상태 | 사용자가 `워커 추가`를 누르면 선택된 프로젝트에 이름을 붙인 `agy` 워커를 추가할 수 있다. 각 워커는 별도 세션과 hcom 참가자 ID를 가지며 준비·작업 중·사용자 조치 필요·중지·연결 끊김을 개별 표시한다. |
-| 작업 전달·회신 | Codex가 같은 프로젝트의 워커 중 하나를 지정해 hcom으로 작업을 보낸다. 해당 워커가 회신하고 Codex가 검토한다. |
-| 인계 기록·폰 접속 | 프로젝트별로 목표, 설계 문서 경로, 브랜치/커밋, 테스트 결과, 다음 작업을 보존한다. 폰은 승인된 사설망과 앱 인증을 거쳐 같은 지시 화면을 사용한다. |
+| 프로젝트 등록·격리 | 로컬 Git 저장소(worktree 포함 동일 저장소 중복 방지) 또는 일반 폴더(`dir:<path>`)를 등록한다. 프로젝트마다 전용 `HCOM_DIR`, Codex 스레드 1개, 기본 `agy` 워커 1개를 두며 세션·목록·메시지·인계 기록을 프로젝트 단위로 완전 격리한다. |
+| 세션 시작·재개 | 첫 시작 시 대화 ID(`threadId`, `conversationId`)를 SQLite에 저장한다. 실행 중이면 기존 연결을 재사용하고 중지 시 저장된 ID로 재개한다. 창 닫기(트레이 상주)·프로젝트 전환·재접속은 실행 상태를 끊지 않는다. |
+| 멀티라운드 오케스트레이션 | 사용자 요청 1건(`requestId`) 안에서 `Codex 판단 → 워커 위임(delegate_work) → 워커 회신 → Codex 검수 → (통과 시 최종 답변 1회 / 보완 필요 시 N차 재지시 / 사용자 판단 필요 시 ask_user로 대기 후 이어가기)` 흐름을 완결한다. |
+| 모델 · 추론 속도 · 권한 제어 | 로컬 `codex`(`model/list`)와 `agy models`에서 실제 모델·추론 강도 목록을 조회한다. Codex(`model`, `reasoningEffort`, `sandboxMode`)와 각 워커(`model`, `reasoningEffort`, `permissionMode`)를 개별 설정·저장한다. |
+| 실시간 생각 로그 & 원격 승인 | Codex 추론·진행 설명·명령·파일 변경·도구 호출과 워커의 상태·`hcom transcript` 로그를 실시간/온디맨드로 확인한다. 등록 폴더는 기본 신뢰·자동 진행(`always-proceed`)을 적용하며, 승인 프롬프트 발생 시 `waiting_approval` 상태에서 앱 내 `승인`/`거절` 버튼으로 원격 복구한다. |
+| 워커 확장 · 직접 대화 | 프로젝트별 추가 워커(`workerId`, 독립 `conversationId`·모델·권한·worktree `cwd`)를 생성·시작·중지·재개한다. 사용자는 Codex 경유 외에 개별 워커와 직접 대화할 수 있다. |
+| 인계 기록 · 설치형 업데이트 | 프로젝트별 목표·설계 문서·브랜치/커밋·테스트 결과·다음 작업·최근 워커 보고/Codex 검토를 보존한다. Windows NSIS 설치형 `.exe` 단일 타깃으로 배포하며 기존 데이터를 유지한 제자리 업데이트를 지원한다. |
 
-**역할 경계.** 같은 프로젝트 안에서도 Codex와 각 Antigravity 워커는 별도 세션과 hcom 참가자로 실행한다. Codex는 설계·분배·검토를 맡으며, 구현 파일 수정과 테스트 실행은 지정된 워커가 맡는다.
+### 화면 구성 (Codex Desktop 스타일 라이트 모노크롬)
 
-**화면 흐름.** 노트북에서 폴더 등록 → 프로젝트 선택 → `시작` 또는 `재개` → 지시·답변 확인. 추가 인력이 필요하면 현재 프로젝트의 `워커 추가`를 열어 이름을 지정한다. 전송 버튼 옆에 대상 프로젝트명을 보여주고, 응답이 진행 중이어도 프로젝트를 전환할 수 있다.
+Windows Codex Desktop 앱의 시각 언어(순백 캔버스 `#FFFFFF`, 초경량 연회색 사이드바 `#F9F9FA`, 헤어라인 경계선 `#EBEBEF`, 짙은 흑색 본문 `#0D0D0D`, 무채색 pill 강조)를 따르는 **4-Zone 레이아웃**을 채택한다.
 
-**데스크톱 화면.** Windows Codex 앱의 화면 구성을 참고해 왼쪽에 접을 수 있는 프로젝트 사이드바, 가운데에 선택된 Codex 대화와 하단 지시창, 오른쪽에 접을 수 있는 워커·인계 패널을 둔다. 사이드바의 프로젝트 항목에서 세션 상태를 확인하고, 오른쪽에서 워커별 상태와 `워커 추가`를 찾는다. 화면은 `hcom_gui` 이름, 청록색 강조색과 자체 아이콘을 사용한다. [Windows Codex 앱 화면 구성](https://learn.chatgpt.com/docs/changelog?type=chatgpt-desktop-app#codex-app-for-windows)
+1. **좌측 아이콘 레일 (`48px`)**: 브랜드 엠블럼, 프로젝트/진단/인계/hcom 로그/업데이트 빠른 전환 아이콘.
+2. **좌측 프로젝트 사이드바 (`~232px`, 접이식)**: 상단 `hcom_gui` 헤더·필터/검색, `+ 새 프로젝트 등록`, 폴더별 프로젝트 목록(상태 점·브랜치 요약·활성 항목 soft pill).
+3. **중앙 대화 캔버스 (유연 폭, `#FFFFFF`)**:
+   - **미니멀 상단 헤더 (`44px`)**: 프로젝트 이름·브랜치·세션 상태 pill과 우측 `시작/재개`·`중지`·더보기·우측 패널 토글 아이콘만 배치해 수직 공간을 최대화한다.
+   - **플랫 대화 피드 (`max-width: 740px`)**: 사용자 메시지는 우측 정렬 연회색 말풍선(`#F3F3F5`), AI 응답은 외곽 박스 테두리 없이 흰 캔버스 위에 직접 흐르며 경량 마크다운/코드 블록 카드(`복사` 버튼 포함)를 XSS-safe DOM으로 렌더링한다. 응답 상단에는 실행 중 펄스 점 + 1줄 추론 요약과 `▾` 상세 로그 토글을 둔다. `waiting_user` / `waiting_approval` 시에만 인라인 액션 카드를 노출한다.
+   - **하단 플로팅 컴포저 (`border-radius: 20px`)**: 상단 자동 확장 입력창 + 하단 통합 툴바(좌측: 대상 전환 `+` 버튼 · Codex 권한 선택 / 우측: Codex 모델 · 추론 속도 선택 · 원형 검정 전송/중지 버튼).
+4. **우측 플로팅 인스펙터 카드 (`~288px`, 둥근 독립 카드, 접이식)**: Codex 앱의 `결과물 / 하위 에이전트 / 소스` 구성을 `hcom_gui` 도메인에 맞춰 재배치한다.
+   - **워커 (상단 메인 섹션 + `+` 추가 버튼)**: 기본은 1줄 요약으로 접혀 있으며, `▾` 펼침 시 모델·추론·권한 설정, 시작/중지/재적용, 온디맨드 생각·도구 로그(`hcom transcript` + 라이브 이벤트), 워커 전용 직접 대화 입력창이 열린다.
+   - **활동 요약 (`hcom`)**: 활성 워커·위임 현황 요약 및 접이식 `hcom 세션 메시지` 스트림.
+   - **프로젝트 · 인계**: 브랜치·커밋·`HCOM_DIR` 격리 정보와 접이식 인계 기록 편집.
 
-**폰 화면.** 인증 후 상단 메뉴에서 프로젝트를 고르고 같은 대화와 하단 지시창을 사용한다. 워커 목록·추가와 인계 기록은 상단에서 여는 패널에 담는다. 데스크톱과 폰은 같은 화면 자산을 사용한다.
+**모바일 / 좁은 화면.** 데스크톱과 동일한 반응형 HTML/CSS/TS 자산을 사용하며 좌우 사이드바는 오버레이 드로어로 전환한다.
 
-**다음 단계.** 한 프로젝트 안에서 여러 워커의 병렬 작업, 상세 로그, 알림, 인계 내보내기, worktree 생성·선택 UI, 폰에서의 권한 승인. MVP는 이미 존재하는 worktree의 소속을 유지한다.
+## 2. 시스템 구성과 기술 스택
 
-**제외 범위.** 다중 사용자, 공개 접속, 클라우드 실행 호스트, 자체 AI 오케스트레이터, 에이전트별 OS 파일 접근 격리, 자동 커밋·푸시·배포. MVP의 세션 지속 범위는 앱이 트레이에서 실행되는 동안이다. 로그아웃·노트북 재부팅·백엔드 종료 시 진행 중인 작업은 중단될 수 있으며, 다시 앱을 열면 기록을 대조하고 같은 대화 ID로 재개한다.
-
-## 2. 구성과 기술 스택
-
-**Electron + TypeScript + Express + SQLite**를 제안한다. Electron의 Chromium 창과 폰 브라우저가 Express에서 제공하는 같은 반응형 HTML/CSS/TypeScript 화면을 사용한다. 전송은 HTTP, 응답·상태는 SSE로 처리한다. Node 런타임 하나로 Windows 앱, HTTP 서버, 자식 프로세스를 다룰 수 있다. SQLite는 등록 정보와 요청·인계 기록을 한 트랜잭션으로 보존할 수 있다. 폰 접속에는 Tailscale Serve를 사용한다. [Electron 앱 수명주기](https://www.electronjs.org/docs/latest/api/app) · [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
+**Electron 44 + TypeScript + Express + SQLite(`node:sqlite`)** 단일 런타임으로 구성한다.
 
 ```mermaid
 flowchart LR
-    phone[폰 브라우저] -->|사설망 HTTPS| serve[Tailscale Serve]
+    phone[폰 브라우저 · 향후] -.->|사설망 HTTPS| serve[Tailscale Serve]
     subgraph laptop[Windows 노트북]
-        desktop[Electron 창] -->|루프백 HTTP| local[Express · 공통 화면 · API]
-        serve -->|루프백 HTTP| local
-        local --> db[(앱 SQLite)]
-        local --> runner[프로젝트별 세션 실행기]
+        desktop[Electron 창 · 4-Zone UI] -->|루프백 HTTP + SSE| local[Express · REST · SSE · 정적 UI]
+        serve -.->|루프백 HTTP| local
+        local --> models[모델 카탈로그 · codex / agy]
+        local --> db[(SQLite WAL)]
+        local --> runner[ProjectManager · 슬롯 잠금 · 오케스트레이터]
         runner -->|stdio JSON-RPC| codex[Codex App Server]
-        runner --> link[hcom 연결부]
-        codex <-->|도구 호출 · 회신 입력| link
-        link <-->|프로젝트 HCOM_DIR| agy[기본·추가 Antigravity 워커]
+        runner -->|onProgress / live ring buffer| local
+        runner --> link[HcomAdapter]
+        codex <-->|list_workers · delegate_work · ask_user| runner
+        link <-->|프로젝트별 HCOM_DIR| agy[기본 · 추가 Antigravity 워커]
     end
 ```
 
-| 구성 | 책임 |
+| 모듈 | 책임 |
 | --- | --- |
-| Electron 메인 프로세스 | 단일 앱 인스턴스, 네이티브 폴더 선택, 창과 트레이 관리. 창 종료는 UI 연결만 끊는다. 트레이에서 앱을 종료할 때만 백엔드를 종료한다. |
-| 로컬 백엔드 | 인증, 프로젝트 등록, 요청 수락, 기록 조회, 프로젝트 단위 SSE. 인증된 데스크톱·폰이 같은 상태를 읽는다. |
-| 프로젝트별 세션 실행기 | 저장된 ID로 재개하고 프로세스 생존과 중복 시작을 확인한다. 프로젝트마다 전용 App Server 자식 프로세스를 stdio로 연결하고, 기본·추가 `agy`의 세션을 개별 관리한다. `hcom agy --headless` 실행은 검증 대상이다. |
-| hcom 연결부 | 각 프로젝트의 Codex를 논리적 hcom 참가자 하나로 등록한다. Codex에 해당 프로젝트의 워커 목록과 상태를 제공하고, 지정된 워커에만 작업을 보내며 회신을 수집한다. 워커 선택·작업 분배·검토는 Codex가 결정한다. |
+| `electron/` | 단일 앱 인스턴스 락, 네이티브 폴더/설치 파일 선택, 창·트레이 수명주기(창 닫기 시 백엔드 유지), 제자리 `.exe` 업데이터(`ELECTRON_RUN_AS_NODE` 제거) |
+| `src/server/` | `127.0.0.1` 루프백 전용 Express 서버, 세션 토큰(`X-Hcom-Token`/`Bearer`)·`Origin`·CSP 보안, CLI 진단(`diagnostics.ts`), 실시간 모델 카탈로그(`models.ts`), 영속 커서 SSE + 임시 라이브 진행 SSE(`/api/projects/:id/events`) |
+| `src/store/` | `node:sqlite` WAL 저장소. `projects`, `codex_sessions`, `workers`, `requests`, `delegations`, `hcom_cursors`, `handoffs`, `project_events` 관리 및 안전한 컬럼 자동 마이그레이션 |
+| `src/runtime/` | `KeyedLock` 기반 슬롯 직렬화, `ProjectManager` 멀티라운드 루프(`delegate_work`, `ask_user`, 회신 압축·중복 방지 `claimDelegationReply`, `resumePendingRequests`), 실시간 링버퍼 로그(`subscribeLive`), 승인 대기 복구(`resolveWorkerApproval`), 참가자 캐시 |
+| `src/codex/` | 프로젝트별 Codex App Server stdio JSON-RPC 연결, `model`/`effort`/`sandbox` 동적 갱신(`setRuntimeConfig`), 턴 ID·`phase: final_answer` 대조, `thread/turns/list` 누락 복구 |
+| `src/hcom/` | 프로젝트 `HCOM_DIR`·세션 환경 격리(`session-env.ts`), `hcom agy` / `hcom r` 실행·ConPTY 화면 안정화(`settleWorker`, 배너·입력 막힘 복구), `injectInput`, `readTranscript`, 이벤트 스트림 구독 |
 
-### 프로젝트 소속, 저장, 복구
+## 3. 프로젝트 격리 · 복구 · 성능 설계
 
-**프로젝트 키.** 등록 시 Windows 절대 경로와 Git 공용 디렉터리의 실제 경로를 해석한다. `git rev-parse --path-format=absolute --git-common-dir`를 사용해 연결된 worktree와 원본을 같은 UUID에 묶는다. `cwd`는 Codex 및 워커별로 보관한다. 기존 worktree로 옮길 때는 동일한 Git 공용 디렉터리인지 확인하고, 해당 세션의 턴과 관련 위임 작업이 모두 끝난 뒤 같은 대화 ID로 새 `cwd`를 적용한다. `agy`가 새 `cwd`에서 같은 대화 ID를 허용하는지는 검증 대상이다. 재개 또는 연결 확인에 실패하면 그 상태를 표시하고 기존 경로를 유지한다. [Git rev-parse](https://git-scm.com/docs/git-rev-parse)
+### 격리와 데이터 무결성
 
-**격리.** `HCOM_DIR`은 예를 들어 `%LOCALAPPDATA%\hcom_gui\projects\<projectId>\hcom`이다. 각 프로젝트의 Codex와 모든 `agy` 워커, 자식 프로세스·훅, hcom 조회·전송 호출에 이 절대 경로를 개별 환경 변수로 전달한다. 전역 환경 변경이나 기본 디렉터리로의 폴백을 허용하지 않는다. 저장된 Codex `threadId`와 `agy` conversation ID는 각각 하나의 프로젝트에만 귀속된다. 백엔드는 `projectId`로 Codex를, `(projectId, workerId)`로 워커와 해당 hcom 참가자를 찾는다. 프로젝트가 다른 대상은 전송 전에 거절한다. 참가자 한 명을 정확히 지목하며 hcom relay는 끈다. `HCOM_DIR`은 통신·기록의 구분이며, 에이전트 파일 권한은 각 CLI의 샌드박스와 승인 설정이 결정한다. [hcom 프로젝트별 격리](https://github.com/aannoo/hcom#per-project-isolation)
+- **프로젝트 키:** Git 저장소는 `git rev-parse --path-format=absolute --git-common-dir`로 worktree와 원본을 같은 프로젝트 UUID로 묶고, 일반 폴더는 `dir:<normalizedPath>` 키로 등록한다.
+- **`HCOM_DIR` 격리:** `%LOCALAPPDATA%\hcom_gui\projects\<projectId>\hcom`을 모든 Codex·`agy`·`hcom` 자식 프로세스에 명시 전달하며, 부모 세션 식별자(`CODEX_*`, `HCOM_*`, `ANTIGRAVITY_*`, `GEMINI_*`, `CLAUDE*`)는 제거한다.
+- **전역 소유권 제약:** `threadId`, `conversationId`, `(projectId, requestId)`, `(projectId, replyEventId)`에 고유 제약을 두어 교차 프로젝트 접근·대화 ID 재사용·회신 중복 검수를 원천 차단한다.
+- **worktree 실측 반영:** `Codex 0.162.1`은 기존 `threadId`로 타 worktree `cwd` 전환이 가능하나, `agy 1.5.18`은 기존 `conversationId`의 타 `cwd` 재개를 지원하지 않는다. 따라서 worktree 작업은 동일 프로젝트(`HCOM_DIR`) 안에서 해당 worktree 경로로 새 워커를 추가해 수행한다.
 
-**추가 워커.** 사용자 추가 요청을 접수하면 프로젝트 안에 새 `workerId`와 이름을 등록하고 새 `agy` 세션을 연결한다. 추가 요청의 재전송은 같은 워커 등록으로 처리한다. 시작 실패는 그 워커의 상태로 표시하고, 재시도는 같은 등록과 저장된 대화 ID를 사용한다. 기본 워커와 기존 Codex는 계속 같은 세션을 사용한다. 프로젝트 시작 시 Codex와 기본 워커를 시작하거나 재개한다. 추가 워커는 목록에서 각각 시작·재개할 수 있다.
+### Codex ↔ hcom ↔ `agy` 오케스트레이션
 
-**기록.** SQLite에 `projectId`로 구분된 등록 정보, Codex 및 워커별 세션, 사용자 요청과 Codex 턴, `workerId`가 연결된 hcom 작업·회신 참조, 인계 기록을 둔다. 인계에는 목표, 프로젝트 상대 설계 문서 경로, 작업 시점의 브랜치와 커밋, 테스트 명령과 결과, 다음 작업을 남긴다. 커밋 없음·테스트 미실행·결과 미확인은 상태로 표현한다. 워커 보고와 Codex 검토를 함께 보존하고, 검토가 끝난 뒤 최신 인계를 갱신한다. UI 전송용 이벤트는 저장한 뒤 발행하며 프로젝트별 커서로 재생한다.
+1. **동적 도구 계약:** Codex 스레드에 `list_workers`(워커별 `tool: 'agy'`, 모델·권한·상태 제공), `delegate_work`(선택 워커에 `hcom send` 전달 + 회신 규칙 자동 부착), `ask_user`(`waiting_user` 전환 및 선택지 제공) 3종을 등록한다.
+2. **멀티라운드 검수 루프:** 워커 회신이 도착하면 `claimDelegationReply`로 1회 처리 권리를 원자적으로 확보하고, `summarizeWorkerReplyForCodex`(결과·변경 파일·테스트 요약 위주)로 압축해 같은 Codex 스레드의 다음 `toolOutput` 턴에 주입한다. Codex가 재위임하면 다음 라운드로 이어가고, 최종 답변(`phase: final_answer`)을 반환하면 요청을 `completed`로 종료한다.
+3. **승인 대기 복구:** 워커 설정(`agy-settings*.json`)에 프로젝트 등록 폴더 `trustedWorkspaces`와 워커별 `permissionMode`를 기록한다. 실행 중 `blocked` 상태가 2.5초 이상 지속되면 요청을 실패 처리하지 않고 `waiting_approval`로 전환하며, 사용자가 앱에서 승인/거절을 누르면 `hcom term inject`로 `\r` 또는 `\x1b`를 전달해 즉시 이어간다.
 
-**중복 방지.** 같은 프로젝트의 Codex 슬롯 또는 같은 `workerId`에 대한 시작·재개를 직렬화한다. 살아 있는 세션에는 재연결하고, 중지 확인 후에만 저장된 ID로 재개한다. PID 단독으로 소유권을 판단하지 않는다. 폰·데스크톱 재전송에는 원래 `requestId`를 재사용하고 `(projectId, requestId)`당 한 번만 접수한다. 전송 직후 연결이 끊겨 상위 프로토콜 접수 여부가 모호하면 `확인 필요`로 기록한 뒤 저장된 턴·이벤트를 대조한다. 이미 실행됐는지 불명확한 요청을 자동 재전송하면 작업이 두 번 실행될 수 있다.
+### 성능 · 배터리 최적화 원칙
 
-**폰 인증.** Express는 `127.0.0.1`에만 바인딩한다. Tailscale 정책에서 승인된 사용자·폰의 노트북 Serve 접근을 허용하고, broad allow 규칙이 이 제한을 무효화하지 않는지 확인한다. Funnel과 공유 링크는 사용하지 않는다. 폰은 데스크톱에서 발급한 만료·일회용 페어링 코드로 별도 앱 세션을 얻고, HTTPS의 `Secure`, `HttpOnly`, `SameSite` 쿠키로 인증한다. 데스크톱은 Electron 메인 프로세스에서 루프백 전용 세션을 받는다. 양쪽 모두 변경 요청의 `Origin` 검증과 인증을 적용하고, 폰에는 로컬 경로 등록과 승인 기능을 열지 않는다. 노트북이 잠들거나 네트워크가 끊기면 폰 화면에 연결 끊김을 표시한다. [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) · [Tailscale 접근 정책](https://tailscale.com/docs/features/access-control/grants) · [Electron 보안](https://www.electronjs.org/docs/latest/tutorial/security)
+- **이벤트 기반 대기:** `waitForWorkerReply`는 `hcom events --follow` 수신 즉시 대기자를 깨우며, 터미널 상태 보조 확인은 작업 미시작 시에만 지수 백오프(`4s → 8s → 15s`)로 최소화한다.
+- **프로세스·DB 쓰기 최소화:** `GET /api/projects/:id`는 캐시된 참가자 스냅샷을 반환하고, 고빈도 추론/출력 델타는 SQLite에 기록하지 않고 인메모리 링버퍼 + 80ms 스로틀 SSE로 전달한 뒤 요청 완료·일시 정지 시 요약만 1회 영속화한다.
+- **프론트엔드 렌더링 절전:** 실시간 진행·메시지 이벤트는 HTTP 재조회 없이 메모리 패치 후 대상 DOM 슬롯만 120ms/`requestAnimationFrame`으로 부분 갱신한다. 구조 변경 이벤트는 150ms 디바운스·단일 비행 조회로 합치며, 창이 트레이 등으로 숨겨지면(`document.visibilitychange`) DOM 렌더링을 중단하고 복귀 시 1회 동기화한다. 워커 상세 로그는 카드가 펼쳐질 때만 온디맨드로 불러온다.
 
-## 3. Codex 입력과 출력
-
-### 권장 경로와 문서로 확인한 사실
-
-**입력.** 앱은 `projectId`와 `requestId`를 받아 서버에 저장된 `threadId`를 조회한다. App Server는 노트북 사용자의 로컬 Codex 인증을 사용한다. `initialize` 후 `thread/start` 또는 ID를 지정한 `thread/resume`으로 연결하고, `turn/start`에 `threadId`와 지시를 전달한다. 반환된 `turn.id`를 요청에 연결한다. 이때 화면 상태는 `Codex 접수`로 바뀐다. [OpenAI Codex App Server의 스레드·턴·인증 API](https://learn.chatgpt.com/docs/app-server)
-
-**출력.** `item/agentMessage/delta`는 진행 중 텍스트에 사용한다. 같은 `threadId`·`turnId`의 `item/completed`에서 `agentMessage` 본문을 저장하고, `phase: final_answer`와 성공한 `turn/completed`를 함께 확인해야 최종 답변으로 표시한다. `phase`는 선택 필드다. 누락 시 공식 이력 API로 재조회하고, 선택 버전에서 검증된 규칙으로도 판별할 수 없으면 `턴 완료 · 최종 답변 확인 필요`를 표시한다. 실패·중단, 본문 누락은 각각 구분한다. 끊긴 뒤에는 `thread/turns/list` 등 공식 이력으로 대조한다. [OpenAI Codex App Server의 알림·이력](https://learn.chatgpt.com/docs/app-server)
-
-**에이전트 왕복.** App Server에 프로젝트 워커 조회와 전송 도구를 등록한다. Codex는 자기 프로젝트의 워커 목록에서 대상을 고르고 `workerId`로 위임한다. 전송 도구는 현재 요청과 워커 소속을 확인한 뒤 해당 Codex의 참가자 명의로 `hcom send`를 실행한다. MVP는 사용자 요청 하나당 위임 작업 하나를 처리한다. 백엔드는 도구 호출 ID, 사용자 요청 ID, 대상 `workerId`, hcom 발신 이벤트 ID를 연결한다. `agy`는 원본 이벤트를 참조해 그 Codex 참가자에게 hcom으로 결과를 보낸다. 연결부는 발신·수신 참가자와 `reply_to`가 일치하는 결과 회신을 저장하고 중복·단순 수신 확인을 걸러낸다. Codex가 위임 턴을 끝내면 같은 스레드에 `turn/start`의 `toolOutput`으로 회신을 넣어 검토 턴을 시작한다. 작업이 있는 요청에서 위임 턴의 답변은 진행 메시지로 남기고, 검토 턴의 성공과 최종 본문이 확인돼야 요청 전체를 완료한다. [hcom 전송 옵션과 이벤트](https://github.com/aannoo/hcom/blob/main/src/commands/send.rs) · [OpenAI Codex App Server의 도구 결과·동적 도구](https://learn.chatgpt.com/docs/app-server)
-
-`hcom send --json`의 `event_id`·`delivered_to`는 hcom 쪽 전송 처리의 증거다. 워커의 처리 완료는 대응 회신, 최종 답변 수신은 Codex 완료 이벤트와 본문으로 각각 확인한다. 연결부에서 `hcom events --follow --full --after-id`의 마지막 처리 ID를 저장해 회신을 재조회한다. hcom DB가 교체되어 이벤트 ID가 초기화되면 이전 커서를 격리하고 해당 프로젝트에 복구가 필요하다고 표시한다. [hcom 변경 이력](https://github.com/aannoo/hcom/blob/main/CHANGELOG.md) · [hcom 이벤트 명령 소스](https://github.com/aannoo/hcom/blob/main/src/commands/events.rs)
-
-### 대안과 확인이 필요한 조합
-
-| 경로 | 확인된 인터페이스와 판단 |
-| --- | --- |
-| hcom 관리형 Codex | `hcom codex`로 연결하고 hcom의 정확한 수신자를 지정할 수 있다. 이벤트·상태·기록은 진단 근거다. 이 경로를 채택하려면 hcom 도착 증거와 별도로 Codex 공식 `notify`의 `agent-turn-complete`, `thread-id`, `turn-id`, 답변 본문을 일치시켜야 한다. 터미널 화면 파싱으로 최종 답변을 판정하지 않는다. [hcom 사용법](https://github.com/aannoo/hcom) · [Codex notify](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications) |
-| Codex SDK / `codex exec` | TypeScript SDK는 ID로 재개하고 `finalResponse`를 제공한다. `exec`는 비대화형 실행에서 JSONL 또는 `--output-last-message`를 제공한다. 이 둘은 단일 턴 대조 실험에 사용할 수 있다. 지속 연결과 승인·턴 이벤트가 필요한 주 경로에는 App Server를 선택한다. [Codex SDK](https://learn.chatgpt.com/docs/codex-sdk) · [Codex 비대화형 모드](https://learn.chatgpt.com/docs/non-interactive-mode) |
-
-**Windows에서 실험할 가정.** `hcom codex` 래퍼의 자동 훅이 독립 App Server에서도 활성화된다는 근거는 확인되지 않았다. 주 경로는 일반 Codex의 수동 참가 방식에 기대므로, 확정된 `threadId`로 수동 참가자를 등록·재사용할 수 있는지, 동일 참가자 명의의 발신과 `agy` 자동 수신·회신이 맞물리는지 검증한다. `dynamicTools`는 공식 문서상 실험적 기능이다. 고정 버전에서 등록·재개·호출 ID와 최종 메시지의 `phase`를 확인한다. `agy --conversation <id>`는 공식 재개 인터페이스이며, hcom을 거친 백그라운드 실행에서 정확한 ID 발견·재개와 승인 대기 처리가 되는지는 별도 검증한다. [hcom 수동 참가 소스](https://github.com/aannoo/hcom/blob/main/src/commands/start.rs) · [OpenAI Codex App Server](https://learn.chatgpt.com/docs/app-server) · [Google Antigravity CLI](https://antigravity.google/docs/cli/reference/)
-
-**승인 처리.** MVP는 Codex의 권한 요청을 상태로 노출하고 별도 승인 UI가 필요한 요청은 거절 또는 취소한다. `agy`는 승인 필요를 상태로 표시하고 사용자가 노트북의 로컬 세션에서 처리하는 경로를 검증한다. 그 경로를 확보하지 못하면 해당 작업은 중지·재개 대상으로 남긴다. 처음 검증할 브랜치 조회는 읽기 전용이다. [Codex App Server 승인 규약](https://learn.chatgpt.com/docs/app-server#approvals) · [Antigravity 실행 모드](https://antigravity.google/docs/cli/reference/#command-line-flags)
-
-단계별 통과 기준은 [구현 계획](../plan/implementation-plan.md)에 정의한다.
+구체적인 단계별 현황과 UI 개편 계획은 [구현 계획](../plan/plan.md)에 정의한다.
