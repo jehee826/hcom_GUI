@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Tray } from 'electron';
+import type { CodexSandboxMode } from '../src/codex/index.ts';
 import { ProjectManager } from '../src/runtime/index.ts';
 import { startGuiServer, type GuiServerHandle } from '../src/server/index.ts';
 import { defaultCodexCandidates, resolveExecutable } from '../src/server/diagnostics.ts';
@@ -49,6 +50,14 @@ function resolveCodexModel(): string | undefined {
   const trimmed = raw.trim();
   if (!trimmed || trimmed === 'default' || trimmed === 'auto') return undefined;
   return trimmed;
+}
+
+function resolveCodexSandbox(): CodexSandboxMode {
+  const raw = process.env.HCOM_GUI_CODEX_SANDBOX?.trim();
+  if (raw === 'read-only' || raw === 'workspace-write' || raw === 'danger-full-access') {
+    return raw;
+  }
+  return 'danger-full-access';
 }
 
 function showMainWindow(): void {
@@ -169,6 +178,7 @@ async function startApp(): Promise<void> {
     dataDir,
     codexCommand,
     model: codexModel,
+    codexSandbox: resolveCodexSandbox(),
     workerSettings,
   });
 

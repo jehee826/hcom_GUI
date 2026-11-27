@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { CodexSession, type DynamicTool, type SessionOptions, type ToolOutput, type ToolResult, type TurnResult } from '../codex/index.ts';
+import { CodexSession, type CodexSandboxMode, type DynamicTool, type SessionOptions, type ToolOutput, type ToolResult, type TurnResult } from '../codex/index.ts';
 import {
   HcomAdapter,
   isJammedTerminal,
@@ -65,6 +65,7 @@ export interface ProjectManagerOptions {
   readonly store?: ProjectStore;
   readonly codexCommand: string;
   readonly model?: string;
+  readonly codexSandbox?: CodexSandboxMode;
   readonly env?: NodeJS.ProcessEnv;
   readonly workerSettings?: Record<string, unknown>;
   readonly replyTimeoutMs?: number;
@@ -125,13 +126,13 @@ const delegateTools: DynamicTool[] = [
   {
     type: 'function',
     name: 'list_workers',
-    description: '현재 프로젝트에 소속된 워커 목록과 상태를 조회한다.',
+    description: '현재 프로젝트의 hcom_gui 관리 워커(Antigravity/agy) 목록과 상태를 조회한다. 셸에서 agy나 hcom list를 직접 실행하지 말고 반드시 이 도구로 워커를 확인한다.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
     type: 'function',
     name: 'delegate_work',
-    description: '현재 프로젝트에 소속된 지정 워커 한 명에게 작업을 위임한다.',
+    description: '현재 프로젝트의 hcom_gui 관리 워커(Antigravity/agy) 한 명에게 hcom으로 작업을 위임한다. 워커 협업 시 셸에서 agy/hcom을 직접 호출하지 말고 반드시 이 도구를 사용한다.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -391,6 +392,7 @@ export class ProjectManager {
       worker = this.store.updateWorker(projectId, workerId, { status: 'starting', lastError: null });
       let launch: WorkerLaunch | undefined;
       try {
+        await this.writeWorkerSettingsFile(projectId, runtime.settingsPath, [worker.cwd]);
         if (worker.conversationId && worker.hcomName) {
           this.assertConversationUnowned(projectId, workerId, worker.conversationId);
           const stopped = await runtime.hcom.getStoppedWorker(worker.hcomName);
@@ -581,6 +583,7 @@ export class ProjectManager {
         processBound: true,
         evidence: 'hcom-managed-binding',
       };
+      await this.writeWorkerSettingsFile(projectId, runtime.settingsPath, [nextCwd]);
 
       let launch: WorkerLaunch | undefined;
       try {
@@ -888,8 +891,7 @@ export class ProjectManager {
       const project = this.requireProject(projectId);
       await mkdir(project.hcomDir, { recursive: true });
       const settingsPath = join(project.hcomDir, 'agy-settings.json');
-      const settingsPayload = JSON.stringify(this.options.workerSettings ?? { agentMode: '' });
-      await writeFile(settingsPath, settingsPayload, 'utf8');
+      await this.writeWorkerSettingsFile(projectId, settingsPath);
 
       const hcom = this.createHcom({ projectId, cwd: project.rootPath, hcomDir: project.hcomDir });
       await hcom.initialize();
@@ -1112,11 +1114,36 @@ export class ProjectManager {
     return participant;
   }
 
+  private async writeWorkerSettingsFile(projectId: string, settingsPath: string, extraPaths: readonly string[] = []): Promise<void> {
+    const project = this.requireProject(projectId);
+    const base: Record<string, unknown> = { agentMode: '', ...(this.options.workerSettings ?? {}) };
+    const rawTrusted = base.trustedWorkspaces;
+    const existingTrusted = Array.isArray(rawTrusted)
+      ? rawTrusted.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    const seen = new Set<string>();
+    const trustedWorkspaces: string[] = [];
+    for (const candidate of [
+      ...existingTrusted,
+      project.rootPath,
+      ...this.store.listWorkers(projectId).map(w => w.cwd),
+      ...extraPaths,
+    ]) {
+      const key = normalizePathKey(candidate);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      trustedWorkspaces.push(candidate);
+    }
+    const payload = JSON.stringify({ ...base, trustedWorkspaces });
+    await writeFile(settingsPath, payload, 'utf8');
+  }
+
   private async connectCodexForCwd(project: ProjectRecord, runtime: ProjectRuntime, cwd: string): Promise<CodexClient> {
     return this.createCodex({
       command: this.options.codexCommand,
       cwd,
       model: this.options.model,
+      sandbox: this.options.codexSandbox ?? 'danger-full-access',
       env: this.options.env ?? process.env,
       hcomDir: project.hcomDir,
       dynamicTools: delegateTools,

@@ -393,3 +393,24 @@ test('settleWorker 에코 프로브가 일반 사용자 입력을 덮어쓰지 �
   assert.equal(await adapter.settleWorker('worker', 12_000), true);
   assert.deepEqual(injected, ['\x0c', 'x', '\x15', '\x0c', 'x', '\x15']);
 });
+
+test('settleWorker는 워크스페이스 신뢰 프롬프트 감지 시 타임아웃을 기다리지 않고 즉시 실패한다', async () => {
+  const runner: Runner = async args => {
+    if (args[0] === 'term' && args[1] === 'worker') {
+      return {
+        code: 0,
+        stderr: '',
+        stdout: JSON.stringify({
+          ready: false,
+          prompt_empty: false,
+          input_text: '',
+          lines: ['Accessing workspace:', 'Do you trust the contents of this project?', '> Yes, I trust this folder'],
+        }),
+      };
+    }
+    return { code: 0, stderr: '', stdout: 'Relay: not configured\n' };
+  };
+  const adapter = new HcomAdapter({ projectId: 'a', cwd: 'C:\\project', hcomDir: 'C:\\isolated' }, runner);
+  await adapter.initialize();
+  await assert.rejects(adapter.settleWorker('worker', 30_000), /로컬 확인 필요/);
+});
