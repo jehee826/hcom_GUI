@@ -74,14 +74,15 @@ flowchart LR
 
 ### Codex ↔ hcom ↔ `agy` 오케스트레이션
 
-1. **동적 도구 계약:** Codex 스레드에 `list_workers`(워커별 `tool: 'agy'`, 모델·권한·상태 제공), `delegate_work`(선택 워커에 `hcom send` 전달 + 회신 규칙 자동 부착), `ask_user`(`waiting_user` 전환 및 선택지 제공) 3종을 등록한다.
-2. **멀티라운드 검수 루프:** 워커 회신이 도착하면 `claimDelegationReply`로 1회 처리 권리를 원자적으로 확보하고, `summarizeWorkerReplyForCodex`(결과·변경 파일·테스트 요약 위주)로 압축해 같은 Codex 스레드의 다음 `toolOutput` 턴에 주입한다. Codex가 재위임하면 다음 라운드로 이어가고, 최종 답변(`phase: final_answer`)을 반환하면 요청을 `completed`로 종료한다.
+1. **동적 도구 계약:** Codex 스레드에 `list_workers`(워커별 핵심 필드만 담은 경량 JSON), `delegate_work`(선택 워커에 `hcom send` 전달 + 회신 규칙 부착), `ask_user`(`waiting_user` 전환 및 선택지 제공) 3종을 등록한다.
+2. **멀티라운드 루프 & 사용자 지침 기반 유연 제어:** 워커 회신이 도착하면 `claimDelegationReply`로 1회 처리 권리를 원자적으로 확보하고, `summarizeWorkerReplyForCodex`(결과·변경 파일·테스트 요약 위주)로 압축해 같은 Codex 스레드의 다음 `toolOutput` 턴에 주입한다. 검수 강도나 위임 스타일은 앱 코드가 강제로 보일러플레이트를 붙이지 않고, 사용자가 원할 때 설정하는 선택형 **사용자 지침**으로 유연하게 제어한다.
 3. **승인 대기 복구:** 워커 설정(`agy-settings*.json`)에 프로젝트 등록 폴더 `trustedWorkspaces`와 워커별 `permissionMode`를 기록한다. 실행 중 `blocked` 상태가 2.5초 이상 지속되면 요청을 실패 처리하지 않고 `waiting_approval`로 전환하며, 사용자가 앱에서 승인/거절을 누르면 `hcom term inject`로 `\r` 또는 `\x1b`를 전달해 즉시 이어간다.
 
-### 성능 · 배터리 최적화 원칙
+### 성능 · 배터리 최적화 및 개발 워크플로 원칙
 
 - **이벤트 기반 대기:** `waitForWorkerReply`는 `hcom events --follow` 수신 즉시 대기자를 깨우며, 터미널 상태 보조 확인은 작업 미시작 시에만 지수 백오프(`4s → 8s → 15s`)로 최소화한다.
-- **프로세스·DB 쓰기 최소화:** `GET /api/projects/:id`는 캐시된 참가자 스냅샷을 반환하고, 고빈도 추론/출력 델타는 SQLite에 기록하지 않고 인메모리 링버퍼 + 80ms 스로틀 SSE로 전달한 뒤 요청 완료·일시 정지 시 요약만 1회 영속화한다.
-- **프론트엔드 렌더링 절전:** 실시간 진행·메시지 이벤트는 HTTP 재조회 없이 메모리 패치 후 대상 DOM 슬롯만 120ms/`requestAnimationFrame`으로 부분 갱신한다. 구조 변경 이벤트는 150ms 디바운스·단일 비행 조회로 합치며, 창이 트레이 등으로 숨겨지면(`document.visibilitychange`) DOM 렌더링을 중단하고 복귀 시 1회 동기화한다. 워커 상세 로그는 카드가 펼쳐질 때만 온디맨드로 불러온다.
+- **초기 로드 분리 · 비동기 진단:** `GET /api/projects/:id`는 최근 요청 이력만 우선 반환하고(이전 이력은 페이지네이션), CLI 진단(`where`·`--version`)은 비동기 실행 + 인메모리 캐시로 분리해 초기 화면 표시를 막지 않는다.
+- **부분 갱신 · 델타 SSE:** 고빈도 추론/출력 델타는 인메모리 링버퍼 + 80ms 스로틀 SSE로 전달하고 완료 시 요약만 SQLite에 1회 저장한다. 구조 변경 SSE(`request.*`, `worker.*`, `codex.*`)도 변경된 엔티티를 실어 프론트엔드가 전체 재조회 없이 바뀐 DOM 슬롯만 120ms/`requestAnimationFrame`으로 부분 패치한다. 창이 숨겨지면(`document.visibilitychange`) DOM 렌더링을 중단하고 복귀 시 1회 동기화하며, 워커 상세 로그는 카드가 펼쳐질 때만 온디맨드로 불러온다.
+- **3단계 검증 흐름:** `npm run dev:web`(브라우저 즉시 확인) → `npm run build && npx --no-install electron .`(트레이·폴더 선택 확인) → 최종 확인 후 `npm run dist`(NSIS `.exe` 빌드).
 
 구체적인 단계별 현황과 UI 개편 계획은 [구현 계획](../plan/plan.md)에 정의한다.
