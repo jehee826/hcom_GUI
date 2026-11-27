@@ -331,9 +331,9 @@ export class HcomAdapter {
     await this.command(['term', 'inject', name, inputMatches ? '\x15\x0c' : '\x0c']);
     return true;
   }
-  async settleWorker(name: string, timeoutMs = 20_000): Promise<boolean> {
+  async settleWorker(name: string, timeoutMs = 45_000): Promise<boolean> {
     const start = Date.now();
-    const fallbackMs = Math.min(12_000, Math.floor(timeoutMs * 0.7));
+    const fallbackMs = Math.min(15_000, Math.floor(timeoutMs * 0.6));
     let stableClean = 0;
     let sawTier = false;
     let syncAttempts = 0;
@@ -360,13 +360,14 @@ export class HcomAdapter {
       if (ready && (sawTier || Date.now() - start >= fallbackMs)) {
         const hasInkFrame = term.lines.some(line => /─{10,}|for shortcuts/.test(line));
         if (hasInkFrame) {
-          if (syncAttempts >= 3) return false;
+          if (syncAttempts >= 6) return false;
           syncAttempts++;
           // ConPTY와 Ink의 비동기 초기 그리기 이후 커서를 입력칸 안으로 재정렬한다.
           await this.command(['term', 'inject', name, '\x0c']);
           await new Promise(resolve => setTimeout(resolve, 500));
           if (await this.probeInputEcho(name)) return true;
           stableClean = 0;
+          await new Promise(resolve => setTimeout(resolve, 1000));
           continue;
         }
         stableClean++;
