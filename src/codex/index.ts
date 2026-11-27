@@ -14,12 +14,19 @@ export type TurnResult = {
   status: 'completed' | 'failed' | 'interrupted' | 'needs_final_answer';
   finalText?: string; reason?: string;
 };
+export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type SessionOptions = {
   command: string; args?: string[]; cwd: string; env: NodeJS.ProcessEnv; hcomDir?: string;
-  model?: string; timeoutMs?: number; dynamicTools?: DynamicTool[];
+  model?: string; sandbox?: CodexSandboxMode; timeoutMs?: number; dynamicTools?: DynamicTool[];
   onToolCall?: (params: JsonObject) => Promise<ToolResult>;
   onProgress?: (event: Progress) => void;
 };
+
+function sandboxPolicyFor(mode: CodexSandboxMode): JsonObject {
+  if (mode === 'danger-full-access') return { type: 'dangerFullAccess' };
+  if (mode === 'workspace-write') return { type: 'workspaceWrite' };
+  return { type: 'readOnly' };
+}
 
 type Pending = { timer: NodeJS.Timeout; resolve: (value: unknown) => void; reject: (error: Error) => void };
 type ActiveTurn = { threadId: string; turnId?: string; buffered: Progress[]; toolRequests: Array<{ id: RpcId; params: JsonObject }>; finalText?: string; missingPhase: boolean; finished: boolean; resolve: (value: TurnResult) => void; reject: (error: Error) => void };
@@ -68,16 +75,19 @@ export class CodexSession {
   async listModels(): Promise<JsonObject> {
     return obj(await this.request('model/list', {}));
   }
+  private sandboxMode(): CodexSandboxMode {
+    return this.options.sandbox ?? 'read-only';
+  }
   async startThread(): Promise<string> {
     return this.bindThread('thread/start', {
-      cwd: this.options.cwd, approvalPolicy: 'never', sandbox: 'read-only',
+      cwd: this.options.cwd, approvalPolicy: 'never', sandbox: this.sandboxMode(),
       ...(this.options.model ? { model: this.options.model } : {}),
       ...(this.options.dynamicTools ? { dynamicTools: this.options.dynamicTools } : {}),
     });
   }
   async resumeThread(threadId: string): Promise<string> {
     if (!nonempty(threadId)) throw new Error('스레드 ID가 잘못되었습니다.');
-    return this.bindThread('thread/resume', { threadId, cwd: this.options.cwd, approvalPolicy: 'never', sandbox: 'read-only', excludeTurns: true, ...(this.options.model ? { model: this.options.model } : {}) }, threadId);
+    return this.bindThread('thread/resume', { threadId, cwd: this.options.cwd, approvalPolicy: 'never', sandbox: this.sandboxMode(), excludeTurns: true, ...(this.options.model ? { model: this.options.model } : {}) }, threadId);
   }
   private async bindThread(method: 'thread/start' | 'thread/resume', params: JsonObject, expectedId?: string): Promise<string> {
     if (this.threadId || this.bindingThread) throw new Error('이미 스레드를 연결했거나 연결하고 있습니다.');
@@ -112,7 +122,7 @@ export class CodexSession {
     completed.finally(() => clearTimeout(timer)).catch(() => {});
     try {
       const result = obj(await this.request('turn/start', {
-        threadId, cwd: this.options.cwd, approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly' },
+        threadId, cwd: this.options.cwd, approvalPolicy: 'never', sandboxPolicy: sandboxPolicyFor(this.sandboxMode()),
         ...('text' in input ? { input: [{ type: 'text', text: input.text }] } : { input: [], toolOutput: input.toolOutput }),
       }));
       const turnId = obj(result.turn).id;

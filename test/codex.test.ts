@@ -124,3 +124,45 @@ test('턴 ID가 확인되기 전 도구 요청도 해당 턴과 대조한다', a
     assert.equal(calls, 1);
   } finally { await session.close(); }
 });
+
+test('sandbox 옵션에 따라 스레드와 턴에 해당 sandbox 정책을 전달한다', async () => {
+  const sandboxServer = String.raw`
+  const readline = require('node:readline');
+  const seen = [];
+  const send = x => process.stdout.write(JSON.stringify(x) + '\n');
+  readline.createInterface({ input: process.stdin }).on('line', line => {
+    const m = JSON.parse(line);
+    if (m.method === 'initialize') return send({ id: m.id, result: {} });
+    if (m.method === 'thread/start' || m.method === 'thread/resume') {
+      seen.push({ method: m.method, sandbox: m.params.sandbox });
+      return send({ id: m.id, result: { thread: { id: 'thread-sb' } } });
+    }
+    if (m.method === 'turn/start') {
+      seen.push({ method: m.method, policy: m.params.sandboxPolicy?.type });
+      send({ method: 'item/completed', params: { threadId: 'thread-sb', turnId: 't-1', item: { type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(seen) } } });
+      send({ method: 'turn/completed', params: { threadId: 'thread-sb', turn: { id: 't-1', status: 'completed', error: null } } });
+      return send({ id: m.id, result: { turn: { id: 't-1' } } });
+    }
+  });`;
+
+  for (const [mode, expectedPolicy] of [['workspace-write', 'workspaceWrite'], ['danger-full-access', 'dangerFullAccess']] as const) {
+    const session = await CodexSession.connect({
+      command: process.execPath,
+      args: ['-e', sandboxServer],
+      cwd: process.cwd(),
+      env: process.env,
+      sandbox: mode,
+    });
+    try {
+      await session.startThread();
+      const res = await session.runTurn({ text: 'check' });
+      assert.equal(res.status, 'completed');
+      assert.deepEqual(JSON.parse(res.finalText ?? '[]'), [
+        { method: 'thread/start', sandbox: mode },
+        { method: 'turn/start', policy: expectedPolicy },
+      ]);
+    } finally {
+      await session.close();
+    }
+  }
+});

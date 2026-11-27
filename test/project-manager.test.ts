@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -515,6 +515,43 @@ test('A·B 동시 요청 처리 중 교차 오염이 없고 활성 요청 중 wo
     assert.match(reqB.finalText ?? '', /C:\\repos\\b/);
     assert.ok(!(reqA.finalText ?? '').includes('C:\\repos\\b'));
     assert.ok(!(reqB.finalText ?? '').includes('C:\\repos\\a'));
+  } finally {
+    await manager.shutdownAll().catch(() => {});
+    rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test('프로젝트 등록 폴더와 추가 worktree 경로를 워커 trustedWorkspaces로 전달하고 Codex sandbox 옵션을 넘긴다', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'hcom-gui-trust-test-'));
+  const network = new FakeHcomNetwork();
+  const codexFactory = new FakeCodexFactory();
+  const seenSandboxes: Array<string | undefined> = [];
+  const manager = new ProjectManager({
+    dataDir,
+    codexCommand: 'fake-codex',
+    git: makeFakeGit(),
+    pollIntervalMs: 10,
+    replyTimeoutMs: 5000,
+    createCodex: async opts => {
+      seenSandboxes.push(opts.sandbox);
+      return codexFactory.create(opts);
+    },
+    createHcom: scope => new FakeHcomClient(scope, network.backendFor(scope)),
+  });
+
+  try {
+    const snap = manager.registerProject('C:\\repos\\a', { name: 'A' });
+    await manager.startProject(snap.project.projectId);
+    assert.deepEqual(seenSandboxes, ['danger-full-access']);
+
+    const settingsPath = join(snap.project.hcomDir, 'agy-settings.json');
+    const initialSettings = JSON.parse(readFileSync(settingsPath, 'utf8')) as { agentMode: string; trustedWorkspaces: string[] };
+    assert.equal(initialSettings.agentMode, '');
+    assert.deepEqual(initialSettings.trustedWorkspaces, ['C:\\repos\\a']);
+
+    await manager.addWorker(snap.project.projectId, { name: 'WT 워커', requestKey: 'wt-trust-1', cwd: 'C:\\repos\\a-wt' });
+    const updatedSettings = JSON.parse(readFileSync(settingsPath, 'utf8')) as { trustedWorkspaces: string[] };
+    assert.deepEqual(updatedSettings.trustedWorkspaces, ['C:\\repos\\a', 'C:\\repos\\a-wt']);
   } finally {
     await manager.shutdownAll().catch(() => {});
     rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

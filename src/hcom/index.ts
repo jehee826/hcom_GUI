@@ -349,6 +349,9 @@ export class HcomAdapter {
         }
         throw error;
       }
+      if (term.lines.some(line => /Do you trust the contents of this project\?/i.test(line))) {
+        throw new Error(`로컬 확인 필요: 워커(${name})가 워크스페이스 신뢰 확인 화면에서 대기 중입니다.`);
+      }
       const hasBanner = term.lines.some(line => line.includes('esc to dismiss'));
       if (term.lines.some(line => /\(Google AI|\bPro\b|\bUltra\b/.test(line))) sawTier = true;
       if (await this.clearBannerOverlay(name)) {
