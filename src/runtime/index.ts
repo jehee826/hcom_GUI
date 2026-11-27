@@ -70,6 +70,7 @@ export interface ProjectManagerOptions {
   readonly workerSettings?: Record<string, unknown>;
   readonly replyTimeoutMs?: number;
   readonly pollIntervalMs?: number;
+  readonly maxDelegationRounds?: number;
   readonly git?: GitInspector;
   readonly createCodex?: (options: SessionOptions) => Promise<CodexClient>;
   readonly createHcom?: (scope: ProjectScope) => HcomClient;
@@ -106,6 +107,55 @@ interface PendingDelegation {
   readonly toolName: string;
 }
 
+interface PendingUserQuestion {
+  readonly question: string;
+  readonly options: string[];
+}
+
+interface ActiveRequestState {
+  readonly requestId: string;
+  round: number;
+  readonly abortController: AbortController;
+  delegation?: PendingDelegation;
+  pendingQuestion?: PendingUserQuestion;
+}
+
+class RequestCancelledError extends Error {
+  constructor(message = '사용자 요청에 의해 작업이 취소되었습니다.') {
+    super(message);
+    this.name = 'RequestCancelledError';
+  }
+}
+
+class WorkerTimeoutError extends Error {
+  constructor(message = '워커 결과 회신 시간 초과') {
+    super(message);
+    this.name = 'WorkerTimeoutError';
+  }
+}
+
+export function summarizeWorkerReplyForCodex(rawText: string, maxChars = 3200): string {
+  const cleaned = rawText
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (cleaned.length <= maxChars) return cleaned;
+
+  const lines = cleaned.split('\n');
+  const keyPattern = /(?:결과|변경\s*파일|수정|생성|삭제|테스트|검증|통과|실패|오류|에러|경고|result|summary|changed\s*files?|modified|test|pass|fail|error)/i;
+  const highlighted = lines.filter(line => keyPattern.test(line));
+  const headBudget = Math.floor(maxChars * 0.45);
+  const tailBudget = Math.floor(maxChars * 0.25);
+  const keyBlock = highlighted.join('\n').slice(0, Math.floor(maxChars * 0.4));
+  const head = cleaned.slice(0, headBudget).trimEnd();
+  const tail = cleaned.slice(-tailBudget).trimStart();
+  const parts = keyBlock.length > 0 && !head.includes(keyBlock.slice(0, 60))
+    ? [`[핵심 요약 추출]\n${keyBlock}`, `[앞부분]\n${head}`, `[뒷부분]\n${tail}`]
+    : [head, tail];
+  return `${parts.join('\n...\n')}\n\n[원문 일부 생략 · 전체 회신은 앱 위임 기록에 저장됨]`.slice(0, maxChars + 120);
+}
+
 interface ProjectRuntime {
   readonly projectId: string;
   readonly hcom: HcomClient;
@@ -118,7 +168,7 @@ interface ProjectRuntime {
   readonly events: HcomEvent[];
   eventError?: Error;
   stopFollow?: () => Promise<void>;
-  activeRequest?: { requestId: string; delegation?: PendingDelegation };
+  activeRequest?: ActiveRequestState;
   reconciled: boolean;
 }
 
@@ -132,14 +182,32 @@ const delegateTools: DynamicTool[] = [
   {
     type: 'function',
     name: 'delegate_work',
-    description: '현재 프로젝트의 hcom_gui 관리 워커(Antigravity/agy) 한 명에게 hcom으로 작업을 위임한다. 워커 협업 시 셸에서 agy/hcom을 직접 호출하지 말고 반드시 이 도구를 사용한다.',
+    description: '현재 프로젝트의 hcom_gui 관리 워커(Antigravity/agy) 한 명에게 hcom으로 작업을 위임하거나 검수 후 보완 재지시를 보낸다. 한 턴에는 한 워커에게 하나씩만 전달하며, 셸에서 agy/hcom을 직접 호출하지 말고 반드시 이 도구를 사용한다.',
     inputSchema: {
       type: 'object',
       properties: {
         workerId: { type: 'string', description: '위임할 현재 프로젝트 소속 워커 ID' },
-        task: { type: 'string', description: '워커에게 전달할 작업 지시' },
+        task: { type: 'string', description: '워커에게 전달할 작업 또는 보완 재지시 내용' },
       },
       required: ['workerId', 'task'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'ask_user',
+    description: '요구사항이나 설계·권한 등 사용자 판단이 필요할 때 질문을 표시하고 답변을 대기한다. 사용자가 답변하면 같은 요청에서 이어서 진행한다.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: '사용자에게 확인할 구체적 질문' },
+        options: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '선택지가 있을 때 제시할 짧은 후보 목록(선택)',
+        },
+      },
+      required: ['question'],
       additionalProperties: false,
     },
   },
@@ -182,9 +250,9 @@ export class ProjectManager {
   registerProject(folderPath: string, options?: { name?: string; defaultWorkerName?: string }): ProjectSnapshot {
     const info = this.git.resolveProject(folderPath);
     const snapshot = this.git.readSnapshot(info.rootPath);
-    const existing = this.store.findProjectByCommonDir(info.gitCommonDirKey);
+    const existing = this.store.findProjectByCommonDir(info.gitCommonDirKey) ?? this.store.findProjectByRootPath(info.rootPath);
     if (existing) {
-      throw new Error(`이미 같은 Git 저장소가 등록되어 있습니다 (${existing.name}, projectId=${existing.projectId}).`);
+      throw new Error(`이미 같은 프로젝트 폴더가 등록되어 있습니다 (${existing.name}, projectId=${existing.projectId}).`);
     }
     const projectId = randomUUID();
     const hcomDir = ProjectStore.projectHcomDir(this.dataDir, projectId);
@@ -640,127 +708,515 @@ export class ProjectManager {
 
   async submitRequest(projectId: string, requestId: string, prompt: string): Promise<RequestRecord> {
     this.requireProject(projectId);
-    const accepted = this.store.acceptRequest({ projectId, requestId, prompt });
+    const accepted = this.store.acceptRequest({ projectId, requestId, prompt, mode: 'codex' });
     if (!accepted.created) return accepted.request;
-    this.emitEvent(projectId, 'request.accepted', { requestId, prompt });
+    this.emitEvent(projectId, 'request.accepted', { requestId, prompt, mode: 'codex' });
 
     return this.locks.run(`request:${projectId}`, async () => {
+      return this.runCodexRequestLoop(projectId, requestId, { text: prompt });
+    });
+  }
+
+  async replyToRequest(projectId: string, requestId: string, replyKey: string, answer: string): Promise<{ request: RequestRecord; deduplicated: boolean }> {
+    this.requireProject(projectId);
+    const trimmedKey = replyKey.trim();
+    const trimmedAnswer = answer.trim();
+    if (!trimmedKey || !trimmedAnswer) {
+      throw new Error('replyKey와 답변 내용(answer)이 필요합니다.');
+    }
+    const existing = this.store.getRequest(projectId, requestId);
+    if (!existing) throw new Error(`요청을 찾을 수 없습니다: ${projectId}/${requestId}`);
+    if (existing.userReplies.some(entry => entry.replyKey === trimmedKey)) {
+      return { request: existing, deduplicated: true };
+    }
+    if (existing.status !== 'waiting_user') {
+      throw new Error(`사용자 답변 대기 상태가 아닌 요청입니다 (${existing.status}).`);
+    }
+    const question = existing.pendingQuestion ?? '';
+    const nextReplies = [
+      ...existing.userReplies,
+      { replyKey: trimmedKey, question, answer: trimmedAnswer, createdAt: new Date().toISOString() },
+    ];
+    this.store.updateRequest(projectId, requestId, {
+      status: 'codex_running',
+      pendingQuestion: null,
+      pendingQuestionOptions: [],
+      userReplies: nextReplies,
+      error: null,
+    });
+    this.emitEvent(projectId, 'request.user_replied', { requestId, replyKey: trimmedKey, question, answer: trimmedAnswer });
+
+    const followup = `[사용자 답변]\n질문: ${question || '(질문 기록 없음)'}\n답변: ${trimmedAnswer}\n\n위 사용자 판단을 반영해 같은 요청을 이어서 완료하세요. 필요하면 delegate_work로 워커에 작업/재지시를 보내고, 추가 확인이 필요하면 ask_user로 질문하세요.`;
+    const result = await this.locks.run(`request:${projectId}`, async () => {
+      return this.runCodexRequestLoop(projectId, requestId, { text: followup });
+    });
+    return { request: result, deduplicated: false };
+  }
+
+  async cancelRequest(projectId: string, requestId: string): Promise<RequestRecord> {
+    this.requireProject(projectId);
+    const current = this.store.getRequest(projectId, requestId);
+    if (!current) throw new Error(`요청을 찾을 수 없습니다: ${projectId}/${requestId}`);
+    if (['completed', 'failed', 'timed_out', 'cancelled'].includes(current.status)) {
+      return current;
+    }
+
+    const runtime = this.runtimes.get(projectId);
+    if (runtime?.activeRequest?.requestId === requestId) {
+      runtime.activeRequest.abortController.abort();
+    }
+
+    for (const del of this.store.listDelegations(projectId, requestId)) {
+      if (del.status === 'sent') {
+        this.store.updateDelegation(projectId, del.delegationId, { status: 'cancelled' });
+        this.store.updateWorker(projectId, del.workerId, { status: 'ready', lastError: null });
+      }
+    }
+    const updated = this.store.updateRequest(projectId, requestId, {
+      status: 'cancelled',
+      pendingQuestion: null,
+      pendingQuestionOptions: [],
+      error: '사용자 요청에 의해 취소되었습니다.',
+    });
+    if (this.store.getCodexSession(projectId)?.status === 'running') {
+      this.store.updateCodexSession(projectId, { status: 'ready', lastError: null });
+    }
+    this.emitEvent(projectId, 'request.cancelled', { requestId, status: 'cancelled' });
+    return updated;
+  }
+
+  async sendDirectWorkerMessage(
+    projectId: string,
+    workerId: string,
+    requestId: string,
+    prompt: string,
+  ): Promise<{ request: RequestRecord; deduplicated: boolean }> {
+    this.requireProject(projectId);
+    this.assertWorkerBelongsToProject(projectId, workerId);
+    const accepted = this.store.acceptRequest({ projectId, requestId, prompt, mode: 'direct_worker', targetWorkerId: workerId });
+    if (!accepted.created) return { request: accepted.request, deduplicated: true };
+    this.emitEvent(projectId, 'request.accepted', { requestId, prompt, mode: 'direct_worker', targetWorkerId: workerId });
+
+    const completed = await this.locks.run(`request:${projectId}`, async () => {
       const runtime = await this.ensureRuntime(projectId);
-      const codex = await this.ensureCodexSession(projectId);
-      this.store.updateRequest(projectId, requestId, { status: 'codex_running' });
-      this.store.updateCodexSession(projectId, { status: 'running', lastError: null });
-      this.emitEvent(projectId, 'request.codex_running', { requestId });
-      runtime.activeRequest = { requestId };
+      const worker = this.assertWorkerBelongsToProject(projectId, workerId);
+      const readyWorker = worker.hcomName && (worker.status === 'ready' || worker.status === 'working')
+        ? worker
+        : await this.startWorker(projectId, workerId);
+      if (!readyWorker.hcomName) throw new Error('워커가 hcom에 등록되지 않았습니다.');
+
+      const sender = await this.ensureCodexParticipant(projectId, runtime);
+      const target: Participant = {
+        projectId,
+        name: readyWorker.hcomName,
+        sessionId: readyWorker.conversationId ?? '',
+        tool: 'agy',
+        status: readyWorker.status,
+      };
+      const abortController = new AbortController();
+      runtime.activeRequest = { requestId, round: 1, abortController };
 
       try {
-        const firstTurn = await codex.runTurn({ text: prompt });
-        const pending = runtime.activeRequest.delegation;
-
-        if (!pending) {
-          const finalStatus = firstTurn.status === 'completed'
-            ? 'completed'
-            : firstTurn.status === 'needs_final_answer'
-              ? 'needs_verification'
-              : firstTurn.status;
-          const record = this.store.updateRequest(projectId, requestId, {
-            status: finalStatus,
-            codexTurnId: firstTurn.turnId,
-            finalText: firstTurn.finalText ?? null,
-            error: firstTurn.reason ?? null,
-          });
-          this.store.updateCodexSession(projectId, { status: 'ready' });
-          this.emitEvent(projectId, 'request.finished', { requestId, status: record.status, finalText: record.finalText });
-          return record;
-        }
-
-        if (firstTurn.status !== 'completed') {
-          const record = this.store.updateRequest(projectId, requestId, {
-            status: firstTurn.status === 'needs_final_answer' ? 'needs_verification' : firstTurn.status,
-            codexTurnId: firstTurn.turnId,
-            error: firstTurn.reason ?? '위임 턴이 완료되지 않았습니다.',
-          });
-          this.store.updateCodexSession(projectId, { status: 'ready' });
-          this.emitEvent(projectId, 'request.finished', { requestId, status: record.status, error: record.error });
-          return record;
-        }
-
-        this.store.updateRequest(projectId, requestId, { status: 'worker_working', codexTurnId: firstTurn.turnId });
+        this.store.updateWorker(projectId, workerId, { status: 'working', lastError: null });
+        const wireTask = this.formatDelegationWireTask(prompt, sender.name);
+        const receipt = await runtime.hcom.send(sender, target, wireTask);
+        const delegation = this.store.createDelegation({
+          projectId,
+          requestId,
+          workerId,
+          round: 1,
+          toolCallId: `direct:${requestId}`,
+          requestEventId: receipt.eventId,
+          prompt,
+        });
+        this.store.updateRequest(projectId, requestId, { status: 'worker_working', round: 1 });
         this.emitEvent(projectId, 'request.worker_working', {
           requestId,
+          round: 1,
+          workerId,
+          workerName: readyWorker.name,
+          requestEventId: receipt.eventId,
+        });
+
+        const reply = await this.waitForWorkerReply(projectId, runtime, sender, target, receipt.eventId, abortController.signal);
+        const replyText = String(reply.data.text).trim();
+        const summaryText = summarizeWorkerReplyForCodex(replyText);
+        const claimed = this.store.claimDelegationReply(projectId, delegation.delegationId, reply.id, replyText, summaryText);
+        if (!claimed.claimed) {
+          return this.store.getRequest(projectId, requestId)!;
+        }
+        await this.bindAfterReply(projectId, workerId, readyWorker, runtime);
+        this.store.updateDelegation(projectId, delegation.delegationId, { status: 'reviewed', reviewedAt: new Date().toISOString() });
+        this.store.updateWorker(projectId, workerId, { status: 'ready', lastError: null });
+        const finalRecord = this.store.updateRequest(projectId, requestId, {
+          status: 'completed',
+          finalText: replyText,
+          error: null,
+        });
+        const gitSnap = this.git.readSnapshot(readyWorker.cwd);
+        this.store.updateHandoff(projectId, {
+          branchStatus: gitSnap.branchStatus,
+          commitStatus: gitSnap.commitStatus,
+          lastWorkerReport: replyText,
+        });
+        this.emitEvent(projectId, 'handoff.updated', { requestId });
+        this.emitEvent(projectId, 'request.finished', { requestId, status: 'completed', finalText: replyText });
+        return finalRecord;
+      } catch (error) {
+        return this.handleRequestFailure(projectId, requestId, error, workerId);
+      } finally {
+        if (runtime.activeRequest?.requestId === requestId) runtime.activeRequest = undefined;
+      }
+    });
+    return { request: completed, deduplicated: false };
+  }
+
+  async resumePendingRequest(projectId: string, requestId: string): Promise<RequestRecord> {
+    this.requireProject(projectId);
+    return this.locks.run(`request:${projectId}`, async () => {
+      const req = this.store.getRequest(projectId, requestId);
+      if (!req) throw new Error(`요청을 찾을 수 없습니다: ${projectId}/${requestId}`);
+      if (['completed', 'failed', 'timed_out', 'cancelled', 'waiting_user'].includes(req.status)) {
+        return req;
+      }
+      const delegations = this.store.listDelegations(projectId, requestId);
+      const latest = delegations.at(-1);
+      if (!latest) return req;
+
+      // 이미 검수 완료된 회신이면 중복 실행하지 않는다.
+      if (latest.reviewedAt) return this.store.getRequest(projectId, requestId)!;
+
+      const runtime = await this.ensureRuntime(projectId, true);
+      const worker = this.store.getWorker(projectId, latest.workerId);
+      if (!worker || !worker.hcomName) {
+        return this.store.updateRequest(projectId, requestId, {
+          status: 'needs_verification',
+          error: '재접속 복구 중 대상 워커의 hcom 참가자 정보를 찾지 못했습니다.',
+        });
+      }
+
+      // 이미 회신이 저장되었으나 검수 턴이 끝나지 않은 경우 바로 검수 턴으로 이어간다.
+      if (latest.status === 'replied' && latest.replyEventId !== null) {
+        const summary = latest.summaryText ?? summarizeWorkerReplyForCodex(latest.replyText ?? '');
+        const reviewInput = this.buildReviewTurnInput(worker.name, latest.round, summary);
+        return this.runCodexRequestLoop(projectId, requestId, reviewInput, latest);
+      }
+
+      // 워커 회신 대기 중(sent)에 백엔드가 재시작된 경우 같은 요청을 이어서 대기한다.
+      if (latest.status === 'sent' && latest.requestEventId !== null) {
+        const sender = await this.ensureCodexParticipant(projectId, runtime);
+        const target: Participant = {
+          projectId,
+          name: worker.hcomName,
+          sessionId: worker.conversationId ?? '',
+          tool: 'agy',
+          status: worker.status,
+        };
+        const pending: PendingDelegation = {
+          delegation: latest,
+          worker,
+          target,
+          receipt: { eventId: latest.requestEventId, deliveredTo: [worker.hcomName] },
+          toolName: 'delegate_work',
+        };
+        return this.runCodexRequestLoop(projectId, requestId, undefined, undefined, pending);
+      }
+      return req;
+    });
+  }
+
+  async resumePendingRequests(projectId: string): Promise<RequestRecord[]> {
+    this.requireProject(projectId);
+    const pending = this.store.listRequests(projectId).filter(req =>
+      req.mode === 'codex' && (req.status === 'worker_working' || req.status === 'codex_reviewing'),
+    );
+    const results: RequestRecord[] = [];
+    for (const req of pending) {
+      results.push(await this.resumePendingRequest(projectId, req.requestId));
+    }
+    return results;
+  }
+
+  private formatDelegationWireTask(task: string, senderName: string): string {
+    if (/--intent\s+inform/i.test(task)) return task;
+    return [
+      task,
+      '',
+      `[hcom 회신 규칙] 작업 완료 후 단순 접수(ack)가 아닌 최종 결과를 반드시 hcom send @${senderName} --intent inform --reply-to <요청ID> 형식으로 회신하세요.`,
+      '회신은 아래 3항목 중심으로 간결하게 작성하세요:',
+      '- 결과: 핵심 수행 내용',
+      '- 변경 파일: 수정·생성한 파일 목록 (없으면 없음)',
+      '- 테스트 요약: 실행한 검증과 결과 (없으면 미실행)',
+    ].join('\n');
+  }
+
+  private buildReviewTurnInput(workerName: string, round: number, summaryText: string): { toolOutput: ToolOutput } {
+    return {
+      toolOutput: {
+        name: 'delegate_work',
+        output: [
+          `워커(${workerName}, ${round}차) 회신 요약:`,
+          summaryText,
+          '',
+          '[검수 지침] 결과를 검수하세요.',
+          '- 충분하면 사용자에게 최종 답변을 한 번만 작성해 완료하세요.',
+          '- 부족하거나 누락이 있으면 delegate_work 도구로 워커에게 구체적으로 보완 재지시하세요.',
+          '- 사용자 판단이 필요하면 ask_user 도구로 질문하세요.',
+        ].join('\n'),
+      },
+    };
+  }
+
+  private handleRequestFailure(projectId: string, requestId: string, error: unknown, fallbackWorkerId?: string): RequestRecord {
+    const existing = this.store.getRequest(projectId, requestId);
+    if (existing?.status === 'cancelled' || error instanceof RequestCancelledError) {
+      const cancelled = this.store.updateRequest(projectId, requestId, {
+        status: 'cancelled',
+        pendingQuestion: null,
+        pendingQuestionOptions: [],
+        error: '사용자 요청에 의해 취소되었습니다.',
+      });
+      this.store.updateCodexSession(projectId, { status: 'ready', lastError: null });
+      if (fallbackWorkerId) this.store.updateWorker(projectId, fallbackWorkerId, { status: 'ready', lastError: null });
+      return cancelled;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    const status: RequestRecord['status'] = error instanceof WorkerTimeoutError
+      ? 'timed_out'
+      : /대기 상태/.test(message)
+        ? 'needs_attention'
+        : /확인/.test(message)
+          ? 'needs_verification'
+          : 'failed';
+    for (const del of this.store.listDelegations(projectId, requestId)) {
+      if (del.status === 'sent' || del.status === 'replied') {
+        const delStatus = status === 'timed_out' ? 'timed_out' : status === 'needs_attention' ? 'needs_attention' : 'failed';
+        this.store.updateDelegation(projectId, del.delegationId, { status: delStatus });
+        this.store.updateWorker(projectId, del.workerId, {
+          status: status === 'needs_attention' ? 'needs_attention' : 'ready',
+          lastError: message,
+        });
+      }
+    }
+    const updated = this.store.updateRequest(projectId, requestId, {
+      status,
+      pendingQuestion: null,
+      pendingQuestionOptions: [],
+      error: message,
+    });
+    this.store.updateCodexSession(projectId, { status: status === 'needs_attention' ? 'needs_attention' : 'ready', lastError: message });
+    this.emitEvent(projectId, 'request.failed', { requestId, status, error: message });
+    return updated;
+  }
+
+  private async runCodexRequestLoop(
+    projectId: string,
+    requestId: string,
+    initialInput?: { text: string } | { toolOutput: ToolOutput },
+    reviewingDelegation?: DelegationRecord,
+    resumedPending?: PendingDelegation,
+  ): Promise<RequestRecord> {
+    const runtime = await this.ensureRuntime(projectId);
+    const codex = await this.ensureCodexSession(projectId);
+    const maxRounds = this.options.maxDelegationRounds ?? 8;
+    const currentReq = this.store.getRequest(projectId, requestId)!;
+    const abortController = new AbortController();
+    const active: ActiveRequestState = {
+      requestId,
+      round: currentReq.round,
+      abortController,
+      delegation: resumedPending,
+    };
+    runtime.activeRequest = active;
+
+    let nextInput = initialInput;
+    let pendingReviewDelegation = reviewingDelegation;
+    let lastWorkerReplyText: string | null = reviewingDelegation?.replyText ?? null;
+
+    try {
+      while (true) {
+        if (abortController.signal.aborted || this.store.getRequest(projectId, requestId)?.status === 'cancelled') {
+          throw new RequestCancelledError();
+        }
+
+        // 1. 대기 중인 워커 위임이 없으면 Codex 턴(판단 또는 검수)을 실행한다.
+        if (!active.delegation) {
+          if (!nextInput) {
+            throw new Error('Codex 다음 턴 입력을 구성할 수 없습니다.');
+          }
+          const isReview = 'toolOutput' in nextInput;
+          this.store.updateRequest(projectId, requestId, {
+            status: isReview ? 'codex_reviewing' : 'codex_running',
+            round: active.round,
+            error: null,
+          });
+          this.store.updateCodexSession(projectId, { status: 'running', lastError: null });
+          if (!isReview) {
+            this.emitEvent(projectId, 'request.codex_running', { requestId, round: active.round });
+          }
+
+          active.delegation = undefined;
+          active.pendingQuestion = undefined;
+          const turn = await codex.runTurn(nextInput);
+
+          if (abortController.signal.aborted || this.store.getRequest(projectId, requestId)?.status === 'cancelled') {
+            throw new RequestCancelledError();
+          }
+
+          // codex.runTurn 내부 onToolCall 콜백이 active 상태를 갱신하므로 명시적으로 다시 읽는다.
+          const asked = active.pendingQuestion as PendingUserQuestion | undefined;
+          const delegated = active.delegation as PendingDelegation | undefined;
+          const turnSucceededForTool = turn.status === 'completed' || (turn.status === 'needs_final_answer' && Boolean(delegated || asked));
+
+          if (pendingReviewDelegation) {
+            this.store.updateDelegation(projectId, pendingReviewDelegation.delegationId, {
+              status: turnSucceededForTool ? 'reviewed' : 'failed',
+              reviewedAt: new Date().toISOString(),
+            });
+            pendingReviewDelegation = undefined;
+          }
+
+          // 1-A. 사용자 판단 필요(ask_user) => 질문 저장 후 대기 상태로 일시 정지 (토큰 소모 0)
+          if (asked && turnSucceededForTool) {
+            const waitingRecord = this.store.updateRequest(projectId, requestId, {
+              status: 'waiting_user',
+              codexTurnId: isReview ? currentReq.codexTurnId : turn.turnId,
+              reviewTurnId: isReview ? turn.turnId : currentReq.reviewTurnId,
+              pendingQuestion: asked.question,
+              pendingQuestionOptions: asked.options,
+              error: null,
+            });
+            this.store.updateCodexSession(projectId, { status: 'ready', lastError: null });
+            this.emitEvent(projectId, 'request.waiting_user', {
+              requestId,
+              round: active.round,
+              question: asked.question,
+              options: asked.options,
+            });
+            return waitingRecord;
+          }
+
+          // 1-B. 추가 위임이 없으면 Codex가 직접 답변했거나 검수를 통과한 최종 완료
+          if (!delegated) {
+            const finalStatus: RequestRecord['status'] = turn.status === 'completed'
+              ? 'completed'
+              : turn.status === 'needs_final_answer'
+                ? 'needs_verification'
+                : turn.status;
+            const finalRecord = this.store.updateRequest(projectId, requestId, {
+              status: finalStatus,
+              round: active.round,
+              codexTurnId: isReview ? this.store.getRequest(projectId, requestId)?.codexTurnId ?? turn.turnId : turn.turnId,
+              reviewTurnId: isReview ? turn.turnId : this.store.getRequest(projectId, requestId)?.reviewTurnId ?? null,
+              pendingQuestion: null,
+              pendingQuestionOptions: [],
+              finalText: turn.finalText ?? null,
+              error: turn.reason ?? null,
+            });
+            this.store.updateCodexSession(projectId, { status: 'ready', lastError: null });
+            if (finalStatus === 'completed') {
+              const gitSnap = this.git.readSnapshot(this.store.getCodexSession(projectId)!.cwd);
+              this.store.updateHandoff(projectId, {
+                branchStatus: gitSnap.branchStatus,
+                commitStatus: gitSnap.commitStatus,
+                ...(lastWorkerReplyText ? { lastWorkerReport: lastWorkerReplyText } : {}),
+                lastCodexReview: turn.finalText ?? null,
+              });
+              this.emitEvent(projectId, 'handoff.updated', { requestId });
+            }
+            this.emitEvent(projectId, 'request.finished', {
+              requestId,
+              status: finalRecord.status,
+              round: finalRecord.round,
+              finalText: finalRecord.finalText,
+              error: finalRecord.error,
+            });
+            return finalRecord;
+          }
+
+          // 1-C. 위임 도구를 호출했으나 Codex 턴 자체가 비정상 종료된 경우 (중간 위임 턴의 final_answer 생략은 정상)
+          if (!turnSucceededForTool) {
+            const failStatus: RequestRecord['status'] = turn.status === 'needs_final_answer' ? 'needs_verification' : turn.status;
+            const record = this.store.updateRequest(projectId, requestId, {
+              status: failStatus,
+              codexTurnId: turn.turnId,
+              error: turn.reason ?? '위임 턴이 완료되지 않았습니다.',
+            });
+            this.store.updateCodexSession(projectId, { status: 'ready' });
+            this.emitEvent(projectId, 'request.finished', { requestId, status: record.status, error: record.error });
+            return record;
+          }
+
+          if (delegated.delegation.round > maxRounds) {
+            throw new Error(`최대 위임 라운드(${maxRounds}회)를 초과했습니다.`);
+          }
+          this.store.updateRequest(projectId, requestId, {
+            codexTurnId: this.store.getRequest(projectId, requestId)?.codexTurnId ?? turn.turnId,
+            round: delegated.delegation.round,
+          });
+        }
+
+        // 2. 워커 작업 대기 단계 (대기 중 Codex 턴 없음 → 토큰 소모 0)
+        const pending = active.delegation as PendingDelegation;
+        active.round = pending.delegation.round;
+        this.store.updateRequest(projectId, requestId, { status: 'worker_working', round: active.round });
+        this.store.updateCodexSession(projectId, { status: 'ready', lastError: null });
+        this.emitEvent(projectId, 'request.worker_working', {
+          requestId,
+          round: active.round,
           workerId: pending.worker.workerId,
           workerName: pending.worker.name,
           requestEventId: pending.receipt.eventId,
         });
 
-        const sender = runtime.codexParticipant!;
-        const reply = await this.waitForWorkerReply(projectId, runtime, sender, pending.target, pending.receipt.eventId);
-        const binding = await this.bindAfterReply(projectId, pending.worker.workerId, pending.worker, runtime);
+        const sender = await this.ensureCodexParticipant(projectId, runtime);
+        const reply = await this.waitForWorkerReply(
+          projectId,
+          runtime,
+          sender,
+          pending.target,
+          pending.receipt.eventId,
+          abortController.signal,
+        );
         const replyText = String(reply.data.text).trim();
+        const summaryText = summarizeWorkerReplyForCodex(replyText);
 
-        this.store.updateDelegation(projectId, pending.delegation.delegationId, {
-          replyEventId: reply.id,
-          replyText,
-          status: 'replied',
-        });
+        // 같은 회신 이벤트가 중복 도착하거나 재접속 재생돼도 검수/재지시는 한 번만 실행한다.
+        const claimed = this.store.claimDelegationReply(projectId, pending.delegation.delegationId, reply.id, replyText, summaryText);
+        if (!claimed.claimed) {
+          active.delegation = undefined;
+          return this.store.getRequest(projectId, requestId)!;
+        }
+
+        const binding = await this.bindAfterReply(projectId, pending.worker.workerId, pending.worker, runtime);
         this.store.updateWorker(projectId, pending.worker.workerId, { status: 'ready', lastError: null });
-        this.store.updateRequest(projectId, requestId, { status: 'codex_reviewing' });
+        this.store.updateRequest(projectId, requestId, { status: 'codex_reviewing', round: active.round });
         this.emitEvent(projectId, 'request.codex_reviewing', {
           requestId,
+          round: active.round,
           workerId: pending.worker.workerId,
           workerName: pending.worker.name,
           replyEventId: reply.id,
           replyText,
+          summaryText,
           conversationId: binding.sessionId,
         });
 
-        const reviewTurn = await codex.runTurn({
-          toolOutput: {
-            name: pending.toolName,
-            output: `워커(${pending.worker.name})의 실제 회신:\n${replyText}`,
-          },
-        });
-        const reviewStatus = reviewTurn.status === 'completed'
-          ? 'completed'
-          : reviewTurn.status === 'needs_final_answer'
-            ? 'needs_verification'
-            : reviewTurn.status;
-        this.store.updateDelegation(projectId, pending.delegation.delegationId, {
-          status: reviewStatus === 'completed' ? 'reviewed' : 'failed',
-        });
-        const finalRecord = this.store.updateRequest(projectId, requestId, {
-          status: reviewStatus,
-          reviewTurnId: reviewTurn.turnId,
-          finalText: reviewTurn.finalText ?? null,
-          error: reviewTurn.reason ?? null,
-        });
-        this.store.updateCodexSession(projectId, { status: 'ready' });
-        if (reviewStatus === 'completed') {
-          const gitSnap = this.git.readSnapshot(this.store.getCodexSession(projectId)!.cwd);
-          this.store.updateHandoff(projectId, {
-            branchStatus: gitSnap.branchStatus,
-            commitStatus: gitSnap.commitStatus,
-            lastWorkerReport: replyText,
-            lastCodexReview: reviewTurn.finalText ?? null,
-          });
-          this.emitEvent(projectId, 'handoff.updated', { requestId });
-        }
-        this.emitEvent(projectId, 'request.finished', {
-          requestId,
-          status: finalRecord.status,
-          finalText: finalRecord.finalText,
-        });
-        return finalRecord;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const status = /대기 상태/.test(message) ? 'needs_attention' : /확인/.test(message) ? 'needs_verification' : 'failed';
-        this.store.updateRequest(projectId, requestId, { status, error: message });
-        this.store.updateCodexSession(projectId, { status: status === 'needs_attention' ? 'needs_attention' : 'ready', lastError: message });
-        this.emitEvent(projectId, 'request.failed', { requestId, status, error: message });
-        throw error;
-      } finally {
-        runtime.activeRequest = undefined;
+        lastWorkerReplyText = replyText;
+        pendingReviewDelegation = claimed.delegation;
+        nextInput = this.buildReviewTurnInput(pending.worker.name, active.round, summaryText);
+        active.delegation = undefined;
       }
-    });
+    } catch (error) {
+      const updated = this.handleRequestFailure(projectId, requestId, error);
+      if (error instanceof RequestCancelledError || error instanceof WorkerTimeoutError) {
+        return updated;
+      }
+      throw error;
+    } finally {
+      if (runtime.activeRequest === active) runtime.activeRequest = undefined;
+    }
   }
 
   async detachProject(projectId: string): Promise<void> {
@@ -869,6 +1325,12 @@ export class ProjectManager {
   }
 
   private assertSameProjectWorktree(project: ProjectRecord, worktreePath: string): string {
+    if (project.gitCommonDirKey.startsWith('dir:')) {
+      if (normalizePathKey(worktreePath) === normalizePathKey(project.rootPath)) {
+        return project.rootPath;
+      }
+      throw new Error('Git 저장소가 아닌 일반 폴더 프로젝트에서는 worktree 전환을 지원하지 않습니다.');
+    }
     const info = this.git.resolveProject(worktreePath);
     if (info.gitCommonDirKey !== project.gitCommonDirKey) {
       throw new Error(`다른 Git 저장소의 작업 경로는 이 프로젝트에 지정할 수 없습니다 (${worktreePath}).`);
@@ -913,11 +1375,20 @@ export class ProjectManager {
   }
 
   private startFollowLoop(projectId: string, runtime: ProjectRuntime): void {
-    const cursor = this.store.getCursor(projectId)?.lastEventId ?? 0;
+    const savedCursor = this.store.getCursor(projectId)?.lastEventId ?? 0;
+    const pendingSentIds = this.store.listDelegations(projectId)
+      .filter(d => d.status === 'sent' && d.requestEventId !== null)
+      .map(d => d.requestEventId as number);
+    const cursor = pendingSentIds.length > 0
+      ? Math.max(0, Math.min(savedCursor, Math.min(...pendingSentIds) - 1))
+      : savedCursor;
+    const seenEventIds = new Set<number>(runtime.events.map(e => e.id));
     runtime.eventError = undefined;
     runtime.stopFollow = runtime.hcom.follow(
       cursor,
       event => {
+        if (seenEventIds.has(event.id)) return;
+        seenEventIds.add(event.id);
         runtime.events.push(event);
         this.store.updateCursor(projectId, event.id);
         this.handleHcomEvent(projectId, event);
@@ -1166,6 +1637,28 @@ export class ProjectManager {
       return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(workers) }] };
     }
 
+    if (tool === 'ask_user') {
+      const active = runtime.activeRequest;
+      const args = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)
+        ? params.arguments as Record<string, unknown>
+        : {};
+      const question = asNonEmptyString(args.question);
+      const options = Array.isArray(args.options)
+        ? args.options.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map(item => item.trim())
+        : [];
+      if (!active || !question) {
+        return { success: false, contentItems: [{ type: 'inputText', text: '질문 내용(question)이 필요합니다.' }] };
+      }
+      if (active.delegation || active.pendingQuestion) {
+        return { success: false, contentItems: [{ type: 'inputText', text: '한 턴에는 위임 또는 사용자 질문 중 하나만 요청할 수 있습니다.' }] };
+      }
+      active.pendingQuestion = { question, options };
+      return {
+        success: true,
+        contentItems: [{ type: 'inputText', text: '사용자에게 질문을 전달하고 답변을 대기합니다. 답변이 도착하면 같은 요청에서 이어집니다.' }],
+      };
+    }
+
     if (tool === 'delegate_work') {
       const active = runtime.activeRequest;
       const callId = asNonEmptyString(params.callId);
@@ -1177,8 +1670,13 @@ export class ProjectManager {
       if (!active || !callId || !workerId || !task) {
         return { success: false, contentItems: [{ type: 'inputText', text: '유효하지 않은 위임 요청 인자입니다.' }] };
       }
-      if (active.delegation) {
-        return { success: false, contentItems: [{ type: 'inputText', text: 'MVP는 요청당 하나의 위임 작업만 허용합니다.' }] };
+      if (active.delegation || active.pendingQuestion) {
+        return { success: false, contentItems: [{ type: 'inputText', text: '한 턴에는 한 워커에게 하나의 작업만 위임할 수 있습니다. 회신을 검수한 뒤 다음 라운드에서 재지시하세요.' }] };
+      }
+      const nextRound = active.round + 1;
+      const maxRounds = this.options.maxDelegationRounds ?? 8;
+      if (nextRound > maxRounds) {
+        return { success: false, contentItems: [{ type: 'inputText', text: `최대 위임 라운드(${maxRounds}회)에 도달했습니다. 현재 결과로 정리하거나 ask_user로 사용자 판단을 요청하세요.` }] };
       }
 
       const worker = this.store.getWorker(projectId, workerId);
@@ -1206,14 +1704,13 @@ export class ProjectManager {
         status: readyWorker.status,
       };
       this.store.updateWorker(projectId, readyWorker.workerId, { status: 'working', lastError: null });
-      const wireTask = /--intent\s+inform/i.test(task)
-        ? task
-        : `${task}\n\n[hcom 회신 규칙] 작업 완료 후 단순 접수(ack)가 아닌 최종 결과를 반드시 hcom send @${sender.name} --intent inform --reply-to <요청ID> 형식으로 회신하세요.`;
+      const wireTask = this.formatDelegationWireTask(task, sender.name);
       const receipt = await runtime.hcom.send(sender, target, wireTask);
       const delegation = this.store.createDelegation({
         projectId,
         requestId: active.requestId,
         workerId: readyWorker.workerId,
+        round: nextRound,
         toolCallId: callId,
         requestEventId: receipt.eventId,
         prompt: task,
@@ -1221,7 +1718,7 @@ export class ProjectManager {
       active.delegation = { delegation, worker: readyWorker, target, receipt, toolName: tool };
       return {
         success: true,
-        contentItems: [{ type: 'inputText', text: `워커(${readyWorker.name}, event #${receipt.eventId})에게 작업을 전달했습니다. 실제 회신은 이후 도구 출력으로 제공됩니다.` }],
+        contentItems: [{ type: 'inputText', text: `워커(${readyWorker.name}, ${nextRound}차, event #${receipt.eventId})에게 작업을 전달했습니다. 실제 회신 요약은 이후 도구 출력으로 제공됩니다.` }],
       };
     }
 
@@ -1261,12 +1758,14 @@ export class ProjectManager {
     sender: Participant,
     target: Participant,
     requestEventId: number,
+    signal?: AbortSignal,
   ): Promise<HcomEvent> {
     const timeoutMs = this.options.replyTimeoutMs ?? 180_000;
     const pollMs = this.options.pollIntervalMs ?? 1000;
     const deadline = Date.now() + timeoutMs;
     let jammedSince: number | undefined;
     for (let tick = 0; Date.now() < deadline; tick++) {
+      if (signal?.aborted) throw new RequestCancelledError();
       if (runtime.eventError) throw runtime.eventError;
       const found = runtime.events.find(event => isWorkerReply(event, projectId, sender, target, requestEventId));
       if (found) return found;
@@ -1288,8 +1787,16 @@ export class ProjectManager {
           jammedSince = undefined;
         }
       }
-      await new Promise(resolve => setTimeout(resolve, pollMs));
+      await new Promise<void>(resolve => {
+        if (!signal) {
+          setTimeout(resolve, pollMs);
+          return;
+        }
+        const onAbort = () => { clearTimeout(timer); resolve(); };
+        const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, pollMs);
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
     }
-    throw new Error('워커 결과 회신 시간 초과');
+    throw new WorkerTimeoutError('워커 결과 회신 시간 초과');
   }
 }
