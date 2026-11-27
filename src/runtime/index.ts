@@ -1949,6 +1949,16 @@ export class ProjectManager {
     const params = event.params;
     const now = new Date().toISOString();
 
+    if (method === 'turn/started') {
+      this.pushRequestProgress(projectId, active.requestId, {
+        ts: now,
+        source: 'codex',
+        kind: 'status',
+        summary: 'Codex 요청 분석 시작',
+      });
+      return;
+    }
+
     if (method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') {
       const delta = typeof params.delta === 'string' ? params.delta : '';
       if (!delta) return;
@@ -1962,31 +1972,63 @@ export class ProjectManager {
       return;
     }
 
+    if (method === 'item/commandExecution/outputDelta') {
+      const delta = typeof params.delta === 'string' ? params.delta : '';
+      if (!delta) return;
+      this.pushRequestProgress(projectId, active.requestId, {
+        ts: now,
+        source: 'codex',
+        kind: 'command_output',
+        summary: delta.split('\n').map(s => s.trim()).filter(Boolean).at(-1)?.slice(0, 120) || '명령 출력 수신 중...',
+        detail: delta,
+      }, true);
+      return;
+    }
+
     if (method === 'item/started' || method === 'item/completed') {
       const item = params.item && typeof params.item === 'object' && !Array.isArray(params.item)
         ? params.item as Record<string, unknown>
         : undefined;
       if (!item) return;
       const itemType = typeof item.type === 'string' ? item.type : '';
-      if (itemType === 'reasoning' && method === 'item/completed') {
-        const summaryArr = Array.isArray(item.summary) ? item.summary.filter((s): s is string => typeof s === 'string') : [];
-        const text = summaryArr.join('\n').trim() || (typeof item.text === 'string' ? item.text.trim() : '');
-        if (!text) return;
+      if (itemType === 'reasoning') {
+        if (method === 'item/started') {
+          this.pushRequestProgress(projectId, active.requestId, {
+            ts: now,
+            source: 'codex',
+            kind: 'reasoning',
+            summary: 'Codex 추론 중...',
+          });
+        } else {
+          const summaryArr = Array.isArray(item.summary) ? item.summary.filter((s): s is string => typeof s === 'string') : [];
+          const text = summaryArr.join('\n').trim() || (typeof item.text === 'string' ? item.text.trim() : '');
+          if (text) {
+            this.pushRequestProgress(projectId, active.requestId, {
+              ts: now,
+              source: 'codex',
+              kind: 'reasoning_done',
+              summary: text.split('\n')[0]!.trim().slice(0, 140),
+              detail: text,
+            });
+          }
+        }
+      } else if (itemType === 'agentMessage' && item.phase === 'commentary') {
+        if (method === 'item/completed' && typeof item.text === 'string' && item.text.trim()) {
+          const text = item.text.trim();
+          this.pushRequestProgress(projectId, active.requestId, {
+            ts: now,
+            source: 'codex',
+            kind: 'commentary',
+            summary: text.split('\n')[0]!.trim().slice(0, 140),
+            detail: text,
+          });
+        }
+      } else if (itemType === 'agentMessage' && item.phase === 'final_answer' && method === 'item/started') {
         this.pushRequestProgress(projectId, active.requestId, {
           ts: now,
           source: 'codex',
-          kind: 'reasoning_done',
-          summary: text.split('\n')[0]!.trim().slice(0, 140),
-          detail: text,
-        });
-      } else if (itemType === 'agentMessage' && item.phase === 'commentary' && typeof item.text === 'string' && item.text.trim()) {
-        const text = item.text.trim();
-        this.pushRequestProgress(projectId, active.requestId, {
-          ts: now,
-          source: 'codex',
-          kind: 'commentary',
-          summary: text.split('\n')[0]!.trim().slice(0, 140),
-          detail: text,
+          kind: 'answer_streaming',
+          summary: '최종 답변 작성 중...',
         });
       } else if (itemType === 'commandExecution') {
         const cmd = typeof item.command === 'string' ? item.command : '';

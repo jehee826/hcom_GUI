@@ -65,17 +65,38 @@
 
       <main class="main-stage">
         <div id="projectBar" class="project-bar hidden">
-          <div class="project-bar-info">
-            <div id="projectPathText" class="mono-text muted-text truncate"></div>
-            <div class="project-bar-meta">
-              <span id="codexStatusChip" class="chip">Codex 중지</span>
-              <span id="threadIdChip" class="chip mono-text hidden"></span>
-              <span id="hcomDirChip" class="chip mono-text hidden"></span>
+          <div class="project-bar-top">
+            <div class="project-bar-info">
+              <div id="projectPathText" class="mono-text muted-text truncate"></div>
+              <div class="project-bar-meta">
+                <span id="codexStatusChip" class="chip">Codex 중지</span>
+                <span id="threadIdChip" class="chip mono-text hidden"></span>
+                <span id="hcomDirChip" class="chip mono-text hidden"></span>
+              </div>
+            </div>
+            <div class="project-bar-actions">
+              <button id="startProjectBtn" class="btn btn-primary btn-sm">시작 / 재개</button>
+              <button id="stopProjectBtn" class="btn btn-outline btn-sm">중지</button>
             </div>
           </div>
-          <div class="project-bar-actions">
-            <button id="startProjectBtn" class="btn btn-primary btn-sm">시작 / 재개</button>
-            <button id="stopProjectBtn" class="btn btn-outline btn-sm">중지</button>
+          <div class="project-controls-bar">
+            <label class="inline-control" title="이 프로젝트의 Codex 오케스트레이터 모델">
+              <span class="inline-control-label">Codex 모델</span>
+              <select id="codexModelSelect" class="select-compact"></select>
+            </label>
+            <label class="inline-control" title="Codex 추론 강도(속도·깊이)">
+              <span class="inline-control-label">추론</span>
+              <select id="codexEffortSelect" class="select-compact"></select>
+            </label>
+            <label class="inline-control" title="Codex 파일·명령 권한 범위">
+              <span class="inline-control-label">권한</span>
+              <select id="codexSandboxSelect" class="select-compact">
+                <option value="workspace-write">작업폴더 쓰기</option>
+                <option value="read-only">읽기 전용</option>
+                <option value="danger-full-access">전체 허용</option>
+              </select>
+            </label>
+            <button id="refreshModelsBtn" class="btn btn-subtle btn-xs" type="button" title="Codex · agy CLI 모델 목록 새로고침">모델 새로고침</button>
           </div>
         </div>
 
@@ -230,6 +251,24 @@
             <input id="addWorkerCwdInput" class="input mono-text" type="text" placeholder="비워두면 프로젝트 기본 경로 사용" />
             <button id="browseWorkerCwdBtn" class="btn btn-outline btn-sm" type="button">폴더</button>
           </div>
+        </label>
+        <div class="field-grid-2">
+          <label class="field">
+            <span class="field-label">모델 (Antigravity agy)</span>
+            <select id="addWorkerModelSelect" class="input"></select>
+          </label>
+          <label class="field">
+            <span class="field-label">추론 속도</span>
+            <select id="addWorkerEffortSelect" class="input"></select>
+          </label>
+        </div>
+        <label class="field">
+          <span class="field-label">워커 권한 수준</span>
+          <select id="addWorkerPermissionSelect" class="input">
+            <option value="always-proceed">자동 진행 (등록 폴더 신뢰 · 권장)</option>
+            <option value="ask">매번 승인 (중요 실행 시 앱에서 승인)</option>
+            <option value="read-only">읽기 전용 (계획·분석 전용)</option>
+          </select>
         </label>
         <div id="addWorkerError" class="error-text hidden"></div>
       </div>
