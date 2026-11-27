@@ -318,3 +318,78 @@ test('정확한 회신만 결과로 인정하고 ACK와 다른 이벤트를 거�
   assert.equal(isWorkerReply(event, 'a', codex, worker, 6), false);
   assert.equal(isWorkerReply({ ...event, data: { ...event.data, from: 'other' } }, 'a', codex, worker, 7), false);
 });
+
+test('다른 worktree 경로로 워커를 시작·재개할 때 --dir 인자와 대상 경로를 전달한다', async () => {
+  const calls: Array<{ args: string[]; cwd: string }> = [];
+  const runner: Runner = async (args, _env, cwd) => {
+    calls.push({ args, cwd });
+    if (args[0] === 'list' && args[1] === '--json') return { code: 0, stderr: '', stdout: '[]' };
+    if (args[0] === 'list' && args[1] === '--stopped') {
+      return { code: 0, stderr: '', stdout: JSON.stringify({ name: 'worker', tool: 'agy', session_id: 'conversation', directory: 'C:\\project' }) };
+    }
+    if (args[0] === 'agy' || args[0] === 'r') {
+      return { code: 0, stderr: '', stdout: JSON.stringify({ launched: 1, failed: 0, names: ['worker'], batch_id: 'batch' }) };
+    }
+    return { code: 0, stderr: '', stdout: 'Relay: not configured\n' };
+  };
+  const adapter = new HcomAdapter({ projectId: 'a', cwd: 'C:\\project', hcomDir: 'C:\\isolated' }, runner);
+  await adapter.initialize();
+  await adapter.launchWorker({ settingsPath: 'C:\\isolated\\agy.json', cwd: 'C:\\project-wt' });
+  const binding = { ...worker, evidence: 'hcom-managed-binding' as const, hooksBound: true as const, processBound: true as const, directory: 'C:\\project' };
+  await adapter.resumeWorker(binding, { settingsPath: 'C:\\isolated\\agy.json', cwd: 'C:\\project-wt' });
+  const stopped = await adapter.getStoppedWorker('worker');
+  assert.equal(stopped?.sessionId, 'conversation');
+  assert.equal(stopped?.projectId, 'a');
+  assert.deepEqual(calls[1], {
+    args: ['agy', '--headless', '--json', '--go', '--dir', 'C:\\project-wt', '--', '--settings', 'C:\\isolated\\agy.json'],
+    cwd: 'C:\\project-wt',
+  });
+  assert.deepEqual(calls[4], {
+    args: ['r', 'worker', '--headless', '--json', '--go', '--dir', 'C:\\project-wt', '--', '--settings', 'C:\\isolated\\agy.json'],
+    cwd: 'C:\\project-wt',
+  });
+});
+
+test('settleWorker 에코 프로브가 일반 사용자 입력을 덮어쓰지 않고 재시도 전 입력을 정리한다', async () => {
+  const injected: string[] = [];
+  let mode: 'foreign' | 'retry' = 'foreign';
+  let attempt = 0;
+  let inputText = '';
+  const runner: Runner = async args => {
+    if (args[0] === 'term' && args[1] === 'inject' && args[2] === 'worker') {
+      injected.push(args[3]!);
+      if (mode === 'retry') {
+        if (args[3] === 'x') {
+          attempt++;
+          inputText = attempt >= 2 ? 'x' : '';
+        } else if (args[3] === '\x15') {
+          inputText = '';
+        }
+      }
+      return { code: 0, stderr: '', stdout: '' };
+    }
+    if (args[0] === 'term' && args[1] === 'worker') {
+      const text = mode === 'foreign' && injected.includes('x') ? 'user draft' : inputText;
+      return {
+        code: 0,
+        stderr: '',
+        stdout: JSON.stringify({
+          ready: text === '',
+          prompt_empty: text === '',
+          input_text: text,
+          lines: ['(Google AI Pro)', '────────', `>${text ? ` ${text}` : ''}`, '────────', '? for shortcuts'],
+        }),
+      };
+    }
+    return { code: 0, stderr: '', stdout: 'Relay: not configured\n' };
+  };
+  const adapter = new HcomAdapter({ projectId: 'a', cwd: 'C:\\project', hcomDir: 'C:\\isolated' }, runner);
+  await adapter.initialize();
+  assert.equal(await adapter.settleWorker('worker', 3000), false);
+  assert.equal(injected.includes('\x15'), false);
+
+  injected.length = 0;
+  mode = 'retry';
+  assert.equal(await adapter.settleWorker('worker', 12_000), true);
+  assert.deepEqual(injected, ['\x0c', 'x', '\x15', '\x0c', 'x', '\x15']);
+});

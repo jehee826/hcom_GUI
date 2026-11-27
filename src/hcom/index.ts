@@ -5,7 +5,10 @@ import { sessionEnvironment } from '../session-env.ts';
 
 export interface ProjectScope { projectId: string; cwd: string; hcomDir: string }
 export interface Participant { projectId: string; name: string; sessionId: string; tool: string; status: string }
+export interface ActiveParticipant extends Participant { baseName: string; directory: string; hooksBound: boolean; processBound: boolean }
+export interface StoppedParticipant { projectId: string; name: string; tool: string; sessionId: string; directory: string }
 export interface WorkerLaunch { readonly name: string; readonly batchId: string; readonly readiness: 'ready' | 'starting' | 'needs_attention' }
+export type WorkerLaunchOptions = string | { settingsPath?: string; cwd?: string };
 export interface WorkerBinding extends Participant { evidence: 'hcom-managed-binding'; hooksBound: true; processBound: true; directory: string }
 export interface Receipt { eventId: number; deliveredTo: string[] }
 export interface HcomEvent { projectId: string; id: number; type: string; instance?: string; data: Record<string, unknown> }
@@ -25,6 +28,17 @@ function workerSettingsArgs(settingsPath?: string): string[] {
   if (!settingsPath) return [];
   if (!(isAbsolute(settingsPath) || win32.isAbsolute(settingsPath))) throw new Error('워커 설정은 절대 경로여야 합니다');
   return ['--', '--settings', settingsPath];
+}
+function normalizeWorkerOptions(options?: WorkerLaunchOptions): { settingsPath?: string; cwd?: string } {
+  if (!options) return {};
+  if (typeof options === 'string') return { settingsPath: options };
+  if (options.cwd !== undefined && !(isAbsolute(options.cwd) || win32.isAbsolute(options.cwd))) {
+    throw new Error('워커 작업 경로는 절대 경로여야 합니다');
+  }
+  return options;
+}
+function samePath(left: string, right: string): boolean {
+  return win32.normalize(left).replace(/[\\/]+$/, '').toLowerCase() === win32.normalize(right).replace(/[\\/]+$/, '').toLowerCase();
 }
 function parseObject(text: string): Record<string, unknown> {
   const value: unknown = JSON.parse(text);
@@ -122,12 +136,14 @@ export class HcomAdapter {
     await this.command(['stop', participant.name]);
     if ((await this.listActive()).some(matches)) throw new Error('Codex 참가자 연결 해제 확인 필요');
   }
-  async launchWorker(settingsPath?: string): Promise<WorkerLaunch> {
+  async launchWorker(options?: WorkerLaunchOptions): Promise<WorkerLaunch> {
     this.requireReady();
-    return this.startWorker(['agy', '--headless', '--json', '--go', ...workerSettingsArgs(settingsPath)]);
+    const { settingsPath, cwd } = normalizeWorkerOptions(options);
+    const dirArgs = cwd && !samePath(cwd, this.scope.cwd) ? ['--dir', cwd] : [];
+    return this.startWorker(['agy', '--headless', '--json', '--go', ...dirArgs, ...workerSettingsArgs(settingsPath)], undefined, cwd);
   }
-  private async startWorker(args: string[], expectedName?: string): Promise<WorkerLaunch> {
-    const result = await this.runner(args, { ...this.env }, this.scope.cwd);
+  private async startWorker(args: string[], expectedName?: string, cwd?: string): Promise<WorkerLaunch> {
+    const result = await this.runner(args, { ...this.env }, cwd ?? this.scope.cwd);
     if (result.code !== 0 && result.code !== 2) {
       throw new Error(`hcom 워커 실행 실패 (${result.code}): ${result.stderr || result.stdout}`);
     }
@@ -151,17 +167,48 @@ export class HcomAdapter {
     if (!Array.isArray(value) || !value.every((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))) throw new Error('참가자 목록 확인 필요');
     return value;
   }
-  private async findWorker(name: string): Promise<(Record<string, unknown> & { tool: string; directory: string }) | undefined> {
+  async listParticipants(): Promise<ActiveParticipant[]> {
+    this.requireReady();
+    const active = await this.listActive();
+    return active.map(item => ({
+      projectId: this.scope.projectId,
+      name: typeof item.name === 'string' ? item.name : '',
+      baseName: typeof item.base_name === 'string' ? item.base_name : (typeof item.name === 'string' ? item.name : ''),
+      tool: typeof item.tool === 'string' ? item.tool : '',
+      status: typeof item.status === 'string' ? item.status : '',
+      sessionId: typeof item.session_id === 'string' ? item.session_id : '',
+      directory: typeof item.directory === 'string' ? item.directory : '',
+      hooksBound: item.hooks_bound === true,
+      processBound: item.process_bound === true,
+    }));
+  }
+  async getStoppedWorker(name: string): Promise<StoppedParticipant | undefined> {
+    this.requireReady(); identity(name);
+    const result = await this.runner(['list', '--stopped', name, '--json'], { ...this.env }, this.scope.cwd);
+    if (result.code !== 0) return undefined;
+    const snapshot = parseObject(result.stdout);
+    if (snapshot.name !== name || typeof snapshot.tool !== 'string' || typeof snapshot.session_id !== 'string' || typeof snapshot.directory !== 'string') {
+      return undefined;
+    }
+    return {
+      projectId: this.scope.projectId,
+      name: snapshot.name,
+      tool: snapshot.tool,
+      sessionId: snapshot.session_id,
+      directory: snapshot.directory,
+    };
+  }
+  private async findWorker(name: string, expectedCwd?: string): Promise<(Record<string, unknown> & { tool: string; directory: string }) | undefined> {
     const matches = (await this.listActive()).filter(item => item.name === name);
     if (matches.length === 0) return undefined;
     if (matches.length !== 1) throw new Error('워커 참가자 확인 필요');
     const item = matches[0];
-    if (item.base_name !== name || (item.tool !== 'agy' && item.tool !== 'antigravity') || typeof item.directory !== 'string' || win32.normalize(item.directory).toLowerCase() !== win32.normalize(this.scope.cwd).toLowerCase()) throw new Error('워커의 프로젝트 소속 확인 필요');
+    if (item.base_name !== name || (item.tool !== 'agy' && item.tool !== 'antigravity') || typeof item.directory !== 'string' || !samePath(item.directory, expectedCwd ?? this.scope.cwd)) throw new Error('워커의 프로젝트 소속 확인 필요');
     return { ...item, tool: item.tool, directory: item.directory };
   }
-  async probeWorker(name: string): Promise<WorkerBinding> {
+  async probeWorker(name: string, expectedCwd?: string): Promise<WorkerBinding> {
     this.requireReady(); identity(name);
-    const item = await this.findWorker(name);
+    const item = await this.findWorker(name, expectedCwd);
     if (!item || item.hooks_bound !== true || item.process_bound !== true || typeof item.session_id !== 'string' || !item.session_id || typeof item.status !== 'string' || item.status === 'stopped') throw new Error('워커의 세션 바인딩 확인 필요');
     return { projectId: this.scope.projectId, name, sessionId: item.session_id, status: item.status, tool: item.tool, directory: item.directory, hooksBound: true, processBound: true, evidence: 'hcom-managed-binding' };
   }
@@ -169,34 +216,59 @@ export class HcomAdapter {
     const active = await this.listActive();
     if (active.some(item => item.name === worker.name || item.base_name === worker.name || item.session_id === worker.sessionId)) throw new Error('워커에 활성 바인딩이 남아 있습니다');
     const snapshot = parseObject(await this.command(['list', '--stopped', worker.name, '--json']));
-    if (snapshot.name !== worker.name || snapshot.tool !== worker.tool || snapshot.session_id !== worker.sessionId || typeof snapshot.directory !== 'string' || win32.normalize(snapshot.directory).toLowerCase() !== win32.normalize(this.scope.cwd).toLowerCase()) throw new Error('중지된 워커와 저장된 세션이 일치하지 않습니다');
+    if (snapshot.name !== worker.name || snapshot.tool !== worker.tool || snapshot.session_id !== worker.sessionId || typeof snapshot.directory !== 'string' || !samePath(snapshot.directory, worker.directory)) throw new Error('중지된 워커와 저장된 세션이 일치하지 않습니다');
   }
   async stopWorker(worker: WorkerBinding): Promise<void> {
     this.requireReady(); this.check(worker);
-    const current = await this.probeWorker(worker.name);
+    const current = await this.probeWorker(worker.name, worker.directory);
     if (current.sessionId !== worker.sessionId) throw new Error('워커 세션이 변경되었습니다');
     await this.command(['kill', worker.name]);
     await this.verifyStopped(worker);
     this.launches.delete(worker.name);
   }
-  async stopLaunch(launch: WorkerLaunch, expectedSessionId?: string): Promise<void> {
+  async stopWorkerByName(name: string, expectedSessionId?: string, expectedCwd?: string | null): Promise<void> {
+    this.requireReady(); identity(name);
+    const active = await this.listActive();
+    const matches = active.filter(item => item.name === name);
+    if (matches.length === 0) {
+      this.launches.delete(name);
+      return;
+    }
+    if (matches.length !== 1) throw new Error('워커 참가자 확인 필요');
+    const current = matches[0];
+    if (current.base_name !== name || (current.tool !== 'agy' && current.tool !== 'antigravity')) {
+      throw new Error('워커의 프로젝트 소속 확인 필요');
+    }
+    if (expectedCwd !== null && (typeof current.directory !== 'string' || !samePath(current.directory, expectedCwd ?? this.scope.cwd))) {
+      throw new Error('워커의 프로젝트 소속 확인 필요');
+    }
+    if (current.process_bound !== true || (expectedSessionId && current.session_id && current.session_id !== expectedSessionId)) {
+      throw new Error('워커 프로세스 또는 세션이 변경되었습니다');
+    }
+    await this.command(['kill', name]);
+    if ((await this.listActive()).some(item => item.name === name)) throw new Error('워커 종료 확인 필요');
+    this.launches.delete(name);
+  }
+  async stopLaunch(launch: WorkerLaunch, expectedSessionId?: string, expectedCwd?: string): Promise<void> {
     this.requireReady();
     if (this.launches.get(launch.name) !== launch) throw new Error('이 연결이 시작한 워커인지 확인할 수 없습니다');
-    const current = await this.findWorker(launch.name);
+    const current = await this.findWorker(launch.name, expectedCwd);
     if (current) {
       if (current.process_bound !== true || (expectedSessionId && current.session_id && current.session_id !== expectedSessionId)) throw new Error('워커 프로세스 또는 세션이 변경되었습니다');
       await this.command(['kill', launch.name]);
-      if (await this.findWorker(launch.name)) throw new Error('워커 종료 확인 필요');
+      if (await this.findWorker(launch.name, expectedCwd)) throw new Error('워커 종료 확인 필요');
     }
     this.launches.delete(launch.name);
   }
-  async resumeWorker(worker: WorkerBinding, settingsPath?: string): Promise<WorkerLaunch> {
+  async resumeWorker(worker: WorkerBinding, options?: WorkerLaunchOptions): Promise<WorkerLaunch> {
     this.requireReady(); this.check(worker);
     await this.verifyStopped(worker);
-    return this.startWorker(['r', worker.name, '--headless', '--json', '--go', ...workerSettingsArgs(settingsPath)], worker.name);
+    const { settingsPath, cwd } = normalizeWorkerOptions(options);
+    const dirArgs = cwd && !samePath(cwd, worker.directory) ? ['--dir', cwd] : [];
+    return this.startWorker(['r', worker.name, '--headless', '--json', '--go', ...dirArgs, ...workerSettingsArgs(settingsPath)], worker.name, cwd ?? worker.directory);
   }
-  async verifyResumedWorker(worker: WorkerBinding): Promise<WorkerBinding> {
-    const current = await this.probeWorker(worker.name);
+  async verifyResumedWorker(worker: WorkerBinding, expectedCwd?: string): Promise<WorkerBinding> {
+    const current = await this.probeWorker(worker.name, expectedCwd ?? worker.directory);
     if (current.sessionId !== worker.sessionId) throw new Error('재개된 native 대화 ID가 다릅니다');
     return current;
   }
@@ -231,20 +303,22 @@ export class HcomAdapter {
   }
   private async probeInputEcho(name: string): Promise<boolean> {
     await this.command(['term', 'inject', name, 'x']);
-    const echoDeadline = Date.now() + 1500;
+    const echoDeadline = Date.now() + 2500;
     let echoed = false;
+    let foreignDraft = false;
     while (Date.now() < echoDeadline) {
       const term = await this.readTerminal(name);
-      if (term.inputText?.trim() === 'x') { echoed = true; break; }
-      if (term.inputText?.trim()) return false;
+      const input = term.inputText?.trim() ?? '';
+      if (input === 'x') { echoed = true; break; }
+      if (input && !/^x+$/.test(input)) { foreignDraft = true; break; }
       await new Promise(resolve => setTimeout(resolve, 100));
     }
-    if (!echoed) return false;
+    if (foreignDraft) return false;
     await this.command(['term', 'inject', name, '\x15']);
-    const clearDeadline = Date.now() + 1500;
+    const clearDeadline = Date.now() + 2000;
     while (Date.now() < clearDeadline) {
       const term = await this.readTerminal(name);
-      if (term.ready && term.promptEmpty === true) return true;
+      if (term.ready && term.promptEmpty === true) return echoed;
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     return false;
