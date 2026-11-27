@@ -17,7 +17,7 @@ export type TurnResult = {
 export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type SessionOptions = {
   command: string; args?: string[]; cwd: string; env: NodeJS.ProcessEnv; hcomDir?: string;
-  model?: string; sandbox?: CodexSandboxMode; timeoutMs?: number; dynamicTools?: DynamicTool[];
+  model?: string; effort?: string; sandbox?: CodexSandboxMode; timeoutMs?: number; dynamicTools?: DynamicTool[];
   onToolCall?: (params: JsonObject) => Promise<ToolResult>;
   onProgress?: (event: Progress) => void;
 };
@@ -43,9 +43,15 @@ export class CodexSession {
   private readonly exit: Promise<void>;
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly options: SessionOptions;
+  private currentModel?: string;
+  private currentEffort?: string;
+  private currentSandbox?: CodexSandboxMode;
   private constructor(child: ChildProcessWithoutNullStreams, options: SessionOptions) {
     this.child = child;
     this.options = options;
+    this.currentModel = options.model;
+    this.currentEffort = options.effort;
+    this.currentSandbox = options.sandbox;
     this.exit = new Promise(resolve => child.once('close', () => resolve()));
     child.on('error', error => this.fail(error));
     child.stdin.on('error', error => this.fail(error));
@@ -75,19 +81,24 @@ export class CodexSession {
   async listModels(): Promise<JsonObject> {
     return obj(await this.request('model/list', {}));
   }
+  setRuntimeConfig(patch: { model?: string | null; effort?: string | null; sandbox?: CodexSandboxMode }): void {
+    if (patch.model !== undefined) this.currentModel = patch.model?.trim() || undefined;
+    if (patch.effort !== undefined) this.currentEffort = patch.effort?.trim() || undefined;
+    if (patch.sandbox !== undefined) this.currentSandbox = patch.sandbox;
+  }
   private sandboxMode(): CodexSandboxMode {
-    return this.options.sandbox ?? 'read-only';
+    return this.currentSandbox ?? 'read-only';
   }
   async startThread(): Promise<string> {
     return this.bindThread('thread/start', {
       cwd: this.options.cwd, approvalPolicy: 'never', sandbox: this.sandboxMode(),
-      ...(this.options.model ? { model: this.options.model } : {}),
+      ...(this.currentModel ? { model: this.currentModel } : {}),
       ...(this.options.dynamicTools ? { dynamicTools: this.options.dynamicTools } : {}),
     });
   }
   async resumeThread(threadId: string): Promise<string> {
     if (!nonempty(threadId)) throw new Error('스레드 ID가 잘못되었습니다.');
-    return this.bindThread('thread/resume', { threadId, cwd: this.options.cwd, approvalPolicy: 'never', sandbox: this.sandboxMode(), excludeTurns: true, ...(this.options.model ? { model: this.options.model } : {}) }, threadId);
+    return this.bindThread('thread/resume', { threadId, cwd: this.options.cwd, approvalPolicy: 'never', sandbox: this.sandboxMode(), excludeTurns: true, ...(this.currentModel ? { model: this.currentModel } : {}) }, threadId);
   }
   private async bindThread(method: 'thread/start' | 'thread/resume', params: JsonObject, expectedId?: string): Promise<string> {
     if (this.threadId || this.bindingThread) throw new Error('이미 스레드를 연결했거나 연결하고 있습니다.');
@@ -123,6 +134,8 @@ export class CodexSession {
     try {
       const result = obj(await this.request('turn/start', {
         threadId, cwd: this.options.cwd, approvalPolicy: 'never', sandboxPolicy: sandboxPolicyFor(this.sandboxMode()),
+        ...(this.currentModel ? { model: this.currentModel } : {}),
+        ...(this.currentEffort ? { effort: this.currentEffort } : {}),
         ...('text' in input ? { input: [{ type: 'text', text: input.text }] } : { input: [], toolOutput: input.toolOutput }),
       }));
       const turnId = obj(result.turn).id;

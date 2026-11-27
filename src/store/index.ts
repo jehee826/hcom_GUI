@@ -5,6 +5,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 export type CodexSessionStatus = 'stopped' | 'starting' | 'ready' | 'running' | 'needs_attention' | 'disconnected' | 'error';
 export type WorkerSessionStatus = 'stopped' | 'starting' | 'ready' | 'working' | 'needs_attention' | 'disconnected' | 'error';
+export type WorkerPermissionMode = 'always-proceed' | 'ask' | 'read-only';
+export type StoredCodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type RequestMode = 'codex' | 'direct_worker';
 export type RequestStatus =
   | 'accepted'
@@ -12,6 +14,7 @@ export type RequestStatus =
   | 'worker_working'
   | 'codex_reviewing'
   | 'waiting_user'
+  | 'waiting_approval'
   | 'completed'
   | 'failed'
   | 'timed_out'
@@ -26,6 +29,23 @@ export interface UserReplyEntry {
   readonly question: string;
   readonly answer: string;
   readonly createdAt: string;
+}
+
+export interface PendingApprovalRecord {
+  readonly workerId: string;
+  readonly workerName: string;
+  readonly hcomName: string;
+  readonly context: string;
+  readonly detail: string;
+  readonly detectedAt: string;
+}
+
+export interface ProgressLogEntry {
+  readonly ts: string;
+  readonly source: 'codex' | 'worker';
+  readonly kind: string;
+  readonly summary: string;
+  readonly detail?: string;
 }
 
 export interface ProjectRecord {
@@ -44,6 +64,9 @@ export interface CodexSessionRecord {
   readonly cwd: string;
   readonly threadId: string | null;
   readonly hcomName: string | null;
+  readonly model: string | null;
+  readonly reasoningEffort: string | null;
+  readonly sandboxMode: StoredCodexSandboxMode;
   readonly status: CodexSessionStatus;
   readonly lastError: string | null;
   readonly updatedAt: string;
@@ -58,6 +81,9 @@ export interface WorkerRecord {
   readonly cwd: string;
   readonly hcomName: string | null;
   readonly conversationId: string | null;
+  readonly model: string | null;
+  readonly reasoningEffort: string | null;
+  readonly permissionMode: WorkerPermissionMode;
   readonly status: WorkerSessionStatus;
   readonly lastError: string | null;
   readonly createdAt: string;
@@ -76,7 +102,9 @@ export interface RequestRecord {
   readonly reviewTurnId: string | null;
   readonly pendingQuestion: string | null;
   readonly pendingQuestionOptions: string[];
+  readonly pendingApproval: PendingApprovalRecord | null;
   readonly userReplies: UserReplyEntry[];
+  readonly progressSummary: ProgressLogEntry[];
   readonly finalText: string | null;
   readonly error: string | null;
   readonly createdAt: string;
@@ -163,11 +191,18 @@ function mapProject(row: Row): ProjectRecord {
 }
 
 function mapCodex(row: Row): CodexSessionRecord {
+  const rawSandbox = asString(row.sandbox_mode);
+  const sandboxMode: StoredCodexSandboxMode = rawSandbox === 'read-only' || rawSandbox === 'workspace-write' || rawSandbox === 'danger-full-access'
+    ? rawSandbox
+    : 'danger-full-access';
   return {
     projectId: asString(row.project_id),
     cwd: asString(row.cwd),
     threadId: asNullableString(row.thread_id),
     hcomName: asNullableString(row.hcom_name),
+    model: asNullableString(row.model),
+    reasoningEffort: asNullableString(row.reasoning_effort),
+    sandboxMode,
     status: asString(row.status) as CodexSessionStatus,
     lastError: asNullableString(row.last_error),
     updatedAt: asString(row.updated_at),
@@ -175,6 +210,10 @@ function mapCodex(row: Row): CodexSessionRecord {
 }
 
 function mapWorker(row: Row): WorkerRecord {
+  const rawPerm = asString(row.permission_mode);
+  const permissionMode: WorkerPermissionMode = rawPerm === 'ask' || rawPerm === 'read-only' || rawPerm === 'always-proceed'
+    ? rawPerm
+    : 'always-proceed';
   return {
     workerId: asString(row.worker_id),
     projectId: asString(row.project_id),
@@ -184,6 +223,9 @@ function mapWorker(row: Row): WorkerRecord {
     cwd: asString(row.cwd),
     hcomName: asNullableString(row.hcom_name),
     conversationId: asNullableString(row.conversation_id),
+    model: asNullableString(row.model),
+    reasoningEffort: asNullableString(row.reasoning_effort),
+    permissionMode,
     status: asString(row.status) as WorkerSessionStatus,
     lastError: asNullableString(row.last_error),
     createdAt: asString(row.created_at),
@@ -218,6 +260,45 @@ function parseUserReplies(raw: unknown): UserReplyEntry[] {
   }
 }
 
+function parsePendingApproval(raw: unknown): PendingApprovalRecord | null {
+  try {
+    const text = asNullableString(raw);
+    if (!text) return null;
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const obj = parsed as Record<string, unknown>;
+    return {
+      workerId: asString(obj.workerId),
+      workerName: asString(obj.workerName),
+      hcomName: asString(obj.hcomName),
+      context: asString(obj.context),
+      detail: asString(obj.detail),
+      detectedAt: asString(obj.detectedAt),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseProgressSummary(raw: unknown): ProgressLogEntry[] {
+  try {
+    const parsed: unknown = JSON.parse(asString(raw) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+      .map(item => ({
+        ts: asString(item.ts),
+        source: item.source === 'worker' ? 'worker' as const : 'codex' as const,
+        kind: asString(item.kind),
+        summary: asString(item.summary),
+        ...(typeof item.detail === 'string' ? { detail: item.detail } : {}),
+      }))
+      .filter(item => item.summary.length > 0);
+  } catch {
+    return [];
+  }
+}
+
 function mapRequest(row: Row): RequestRecord {
   const rawMode = asString(row.mode);
   return {
@@ -232,7 +313,9 @@ function mapRequest(row: Row): RequestRecord {
     reviewTurnId: asNullableString(row.review_turn_id),
     pendingQuestion: asNullableString(row.pending_question),
     pendingQuestionOptions: parseStringArray(row.pending_question_options_json),
+    pendingApproval: parsePendingApproval(row.pending_approval_json),
     userReplies: parseUserReplies(row.user_replies_json),
+    progressSummary: parseProgressSummary(row.progress_summary_json),
     finalText: asNullableString(row.final_text),
     error: asNullableString(row.error),
     createdAt: asString(row.created_at),
@@ -439,12 +522,22 @@ export class ProjectStore {
     `);
 
     // 기존 DB 업그레이드 호환을 위한 컬럼 마이그레이션
+    this.ensureColumn('codex_sessions', 'model', 'TEXT');
+    this.ensureColumn('codex_sessions', 'reasoning_effort', 'TEXT');
+    this.ensureColumn('codex_sessions', 'sandbox_mode', "TEXT NOT NULL DEFAULT 'danger-full-access'");
+
+    this.ensureColumn('workers', 'model', 'TEXT');
+    this.ensureColumn('workers', 'reasoning_effort', 'TEXT');
+    this.ensureColumn('workers', 'permission_mode', "TEXT NOT NULL DEFAULT 'always-proceed'");
+
     this.ensureColumn('requests', 'mode', "TEXT NOT NULL DEFAULT 'codex'");
     this.ensureColumn('requests', 'target_worker_id', 'TEXT');
     this.ensureColumn('requests', 'round', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('requests', 'pending_question', 'TEXT');
     this.ensureColumn('requests', 'pending_question_options_json', "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn('requests', 'pending_approval_json', 'TEXT');
     this.ensureColumn('requests', 'user_replies_json', "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn('requests', 'progress_summary_json', "TEXT NOT NULL DEFAULT '[]'");
 
     this.ensureColumn('delegations', 'round', 'INTEGER NOT NULL DEFAULT 1');
     this.ensureColumn('delegations', 'summary_text', 'TEXT');
@@ -565,7 +658,16 @@ export class ProjectStore {
 
   updateCodexSession(
     projectId: string,
-    patch: Partial<{ cwd: string; threadId: string | null; hcomName: string | null; status: CodexSessionStatus; lastError: string | null }>,
+    patch: Partial<{
+      cwd: string;
+      threadId: string | null;
+      hcomName: string | null;
+      model: string | null;
+      reasoningEffort: string | null;
+      sandboxMode: StoredCodexSandboxMode;
+      status: CodexSessionStatus;
+      lastError: string | null;
+    }>,
   ): CodexSessionRecord {
     return this.transaction(() => {
       const current = this.getCodexSession(projectId);
@@ -582,15 +684,18 @@ export class ProjectStore {
         cwd: patch.cwd !== undefined ? patch.cwd : current.cwd,
         threadId: nextThreadId,
         hcomName: patch.hcomName !== undefined ? patch.hcomName : current.hcomName,
+        model: patch.model !== undefined ? patch.model : current.model,
+        reasoningEffort: patch.reasoningEffort !== undefined ? patch.reasoningEffort : current.reasoningEffort,
+        sandboxMode: patch.sandboxMode !== undefined ? patch.sandboxMode : current.sandboxMode,
         status: patch.status !== undefined ? patch.status : current.status,
         lastError: patch.lastError !== undefined ? patch.lastError : current.lastError,
         updatedAt: nowIso(),
       };
       this.db.prepare(`
         UPDATE codex_sessions
-        SET cwd = ?, thread_id = ?, hcom_name = ?, status = ?, last_error = ?, updated_at = ?
+        SET cwd = ?, thread_id = ?, hcom_name = ?, model = ?, reasoning_effort = ?, sandbox_mode = ?, status = ?, last_error = ?, updated_at = ?
         WHERE project_id = ?
-      `).run(next.cwd, next.threadId, next.hcomName, next.status, next.lastError, next.updatedAt, projectId);
+      `).run(next.cwd, next.threadId, next.hcomName, next.model, next.reasoningEffort, next.sandboxMode, next.status, next.lastError, next.updatedAt, projectId);
       return next;
     });
   }
@@ -625,7 +730,15 @@ export class ProjectStore {
     return row ? mapWorker(row) : undefined;
   }
 
-  createAdditionalWorker(input: { projectId: string; name: string; requestKey: string; cwd: string }): { worker: WorkerRecord; created: boolean } {
+  createAdditionalWorker(input: {
+    projectId: string;
+    name: string;
+    requestKey: string;
+    cwd: string;
+    model?: string | null;
+    reasoningEffort?: string | null;
+    permissionMode?: WorkerPermissionMode;
+  }): { worker: WorkerRecord; created: boolean } {
     if (!input.name.trim()) throw new Error('워커 이름이 필요합니다.');
     if (!input.requestKey.trim()) throw new Error('워커 추가 요청 식별자(requestKey)가 필요합니다.');
     return this.transaction(() => {
@@ -635,9 +748,20 @@ export class ProjectStore {
       const workerId = randomUUID();
       const now = nowIso();
       this.db.prepare(`
-        INSERT INTO workers (worker_id, project_id, request_key, name, is_default, cwd, hcom_name, conversation_id, status, last_error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 0, ?, NULL, NULL, 'stopped', NULL, ?, ?)
-      `).run(workerId, input.projectId, input.requestKey, input.name.trim(), input.cwd, now, now);
+        INSERT INTO workers (worker_id, project_id, request_key, name, is_default, cwd, hcom_name, conversation_id, model, reasoning_effort, permission_mode, status, last_error, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?, ?, 'stopped', NULL, ?, ?)
+      `).run(
+        workerId,
+        input.projectId,
+        input.requestKey,
+        input.name.trim(),
+        input.cwd,
+        input.model ?? null,
+        input.reasoningEffort ?? null,
+        input.permissionMode ?? 'always-proceed',
+        now,
+        now,
+      );
       return { worker: this.getWorker(input.projectId, workerId)!, created: true };
     });
   }
@@ -645,7 +769,17 @@ export class ProjectStore {
   updateWorker(
     projectId: string,
     workerId: string,
-    patch: Partial<{ name: string; cwd: string; hcomName: string | null; conversationId: string | null; status: WorkerSessionStatus; lastError: string | null }>,
+    patch: Partial<{
+      name: string;
+      cwd: string;
+      hcomName: string | null;
+      conversationId: string | null;
+      model: string | null;
+      reasoningEffort: string | null;
+      permissionMode: WorkerPermissionMode;
+      status: WorkerSessionStatus;
+      lastError: string | null;
+    }>,
   ): WorkerRecord {
     return this.transaction(() => {
       const current = this.getWorker(projectId, workerId);
@@ -667,15 +801,31 @@ export class ProjectStore {
         cwd: patch.cwd !== undefined ? patch.cwd : current.cwd,
         hcomName: patch.hcomName !== undefined ? patch.hcomName : current.hcomName,
         conversationId: nextConvId,
+        model: patch.model !== undefined ? patch.model : current.model,
+        reasoningEffort: patch.reasoningEffort !== undefined ? patch.reasoningEffort : current.reasoningEffort,
+        permissionMode: patch.permissionMode !== undefined ? patch.permissionMode : current.permissionMode,
         status: patch.status !== undefined ? patch.status : current.status,
         lastError: patch.lastError !== undefined ? patch.lastError : current.lastError,
         updatedAt: nowIso(),
       };
       this.db.prepare(`
         UPDATE workers
-        SET name = ?, cwd = ?, hcom_name = ?, conversation_id = ?, status = ?, last_error = ?, updated_at = ?
+        SET name = ?, cwd = ?, hcom_name = ?, conversation_id = ?, model = ?, reasoning_effort = ?, permission_mode = ?, status = ?, last_error = ?, updated_at = ?
         WHERE project_id = ? AND worker_id = ?
-      `).run(next.name, next.cwd, next.hcomName, next.conversationId, next.status, next.lastError, next.updatedAt, projectId, workerId);
+      `).run(
+        next.name,
+        next.cwd,
+        next.hcomName,
+        next.conversationId,
+        next.model,
+        next.reasoningEffort,
+        next.permissionMode,
+        next.status,
+        next.lastError,
+        next.updatedAt,
+        projectId,
+        workerId,
+      );
       return next;
     });
   }
@@ -726,7 +876,9 @@ export class ProjectStore {
       reviewTurnId: string | null;
       pendingQuestion: string | null;
       pendingQuestionOptions: string[];
+      pendingApproval: PendingApprovalRecord | null;
       userReplies: UserReplyEntry[];
+      progressSummary: ProgressLogEntry[];
       finalText: string | null;
       error: string | null;
     }>,
@@ -742,7 +894,9 @@ export class ProjectStore {
         reviewTurnId: patch.reviewTurnId !== undefined ? patch.reviewTurnId : current.reviewTurnId,
         pendingQuestion: patch.pendingQuestion !== undefined ? patch.pendingQuestion : current.pendingQuestion,
         pendingQuestionOptions: patch.pendingQuestionOptions !== undefined ? patch.pendingQuestionOptions : current.pendingQuestionOptions,
+        pendingApproval: patch.pendingApproval !== undefined ? patch.pendingApproval : current.pendingApproval,
         userReplies: patch.userReplies !== undefined ? patch.userReplies : current.userReplies,
+        progressSummary: patch.progressSummary !== undefined ? patch.progressSummary : current.progressSummary,
         finalText: patch.finalText !== undefined ? patch.finalText : current.finalText,
         error: patch.error !== undefined ? patch.error : current.error,
         updatedAt: nowIso(),
@@ -750,7 +904,8 @@ export class ProjectStore {
       this.db.prepare(`
         UPDATE requests
         SET status = ?, round = ?, codex_turn_id = ?, review_turn_id = ?,
-            pending_question = ?, pending_question_options_json = ?, user_replies_json = ?,
+            pending_question = ?, pending_question_options_json = ?, pending_approval_json = ?,
+            user_replies_json = ?, progress_summary_json = ?,
             final_text = ?, error = ?, updated_at = ?
         WHERE project_id = ? AND request_id = ?
       `).run(
@@ -760,7 +915,9 @@ export class ProjectStore {
         next.reviewTurnId,
         next.pendingQuestion,
         JSON.stringify(next.pendingQuestionOptions),
+        next.pendingApproval ? JSON.stringify(next.pendingApproval) : null,
         JSON.stringify(next.userReplies),
+        JSON.stringify(next.progressSummary),
         next.finalText,
         next.error,
         next.updatedAt,
@@ -774,7 +931,7 @@ export class ProjectStore {
   hasActiveRequest(projectId: string): boolean {
     const row = this.db.prepare(`
       SELECT 1 AS active FROM requests
-      WHERE project_id = ? AND status IN ('accepted', 'codex_running', 'worker_working', 'codex_reviewing')
+      WHERE project_id = ? AND status IN ('accepted', 'codex_running', 'worker_working', 'codex_reviewing', 'waiting_approval')
       LIMIT 1
     `).get(projectId) as Row | undefined;
     return Boolean(row);
