@@ -6,7 +6,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
-    "verify:roundtrip": "node scripts/verify-roundtrip.ts"
+    "verify:roundtrip": "node scripts/verify-roundtrip.ts",
+    "verify:stage2": "node scripts/verify-stage2.ts"
   },
   "devDependencies": {
     "@types/node": "24.10.1",
