@@ -14,7 +14,8 @@
     "test": "node --test test/*.test.ts",
     "verify:roundtrip": "node scripts/verify-roundtrip.ts",
     "verify:stage2": "node scripts/verify-stage2.ts",
-    "verify:installed": "node scripts/verify-installed.ts"
+    "verify:installed": "node scripts/verify-installed.ts",
+    "verify:orchestration": "node scripts/verify-orchestration.ts"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

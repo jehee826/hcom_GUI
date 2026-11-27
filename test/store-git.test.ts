@@ -11,7 +11,7 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }).trim();
 }
 
-test('Git 공용 디렉터리로 worktree 중복 등록을 막고 커밋·브랜치 상태를 정확히 읽는다', () => {
+test('Git 공용 디렉터리로 worktree 중복 등록을 막고 일반 폴더 및 커밋·브랜치 상태를 정확히 읽는다', async () => {
   const root = mkdtempSync(join(tmpdir(), 'hcom-gui-git-test-'));
   try {
     const emptyRepo = join(root, 'empty-a');
@@ -78,7 +78,43 @@ test('Git 공용 디렉터리로 worktree 중복 등록을 막고 커밋·브랜
         hcomDir: ProjectStore.projectHcomDir(join(root, 'data'), 'proj-b-wt'),
         branchStatus: snapWt.branchStatus,
         commitStatus: snapWt.commitStatus,
-      }), /이미 같은 Git 저장소/);
+      }), /이미 같은 프로젝트 폴더/);
+
+      // Git 없는 일반 폴더 등록 및 이후 git init 시 중복 등록 차단 확인
+      const plainDir = join(root, 'plain-folder');
+      writeFileSync(join(root, 'marker'), 'x', 'utf8');
+      git(root, 'version');
+      const { mkdirSync } = await import('node:fs');
+      mkdirSync(plainDir, { recursive: true });
+      const infoPlain = resolveGitProject(plainDir);
+      assert.equal(infoPlain.isGitRepo, false);
+      assert.ok(infoPlain.gitCommonDirKey.startsWith('dir:'));
+      const snapPlain = readGitSnapshot(plainDir);
+      assert.equal(snapPlain.branchStatus, 'Git 없음');
+      assert.equal(snapPlain.commitStatus, 'Git 없음');
+
+      store.registerProject({
+        name: 'Plain',
+        rootPath: infoPlain.rootPath,
+        gitCommonDir: infoPlain.gitCommonDir,
+        gitCommonDirKey: infoPlain.gitCommonDirKey,
+        hcomDir: ProjectStore.projectHcomDir(join(root, 'data'), 'proj-plain'),
+        branchStatus: snapPlain.branchStatus,
+        commitStatus: snapPlain.commitStatus,
+        projectId: 'proj-plain',
+      });
+      git(root, 'init', '-b', 'main', plainDir);
+      const infoAfterGitInit = resolveGitProject(plainDir);
+      assert.equal(infoAfterGitInit.isGitRepo, true);
+      assert.throws(() => store.registerProject({
+        name: 'Plain-dup',
+        rootPath: infoAfterGitInit.rootPath,
+        gitCommonDir: infoAfterGitInit.gitCommonDir,
+        gitCommonDirKey: infoAfterGitInit.gitCommonDirKey,
+        hcomDir: ProjectStore.projectHcomDir(join(root, 'data'), 'proj-plain-2'),
+        branchStatus: 'main',
+        commitStatus: '커밋 없음',
+      }), /이미 같은 프로젝트 폴더/);
 
       store.selectProject(regB.project.projectId);
       store.updateHandoff(regA.project.projectId, {
@@ -99,7 +135,7 @@ test('Git 공용 디렉터리로 worktree 중복 등록을 막고 커밋·브랜
     const reopened = new ProjectStore(dbPath);
     try {
       assert.equal(reopened.getSelectedProjectId(), 'proj-b');
-      assert.equal(reopened.listProjects().length, 2);
+      assert.equal(reopened.listProjects().length, 3);
       const handoffA = reopened.getHandoff('proj-a')!;
       const handoffB = reopened.getHandoff('proj-b')!;
       assert.equal(handoffA.goal, 'A 목표');

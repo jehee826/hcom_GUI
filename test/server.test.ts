@@ -238,6 +238,44 @@ test('Express API와 SSE는 토큰 인증·Origin 검증·프로젝트별 격리
     assert.equal(replayed.length, 1);
     assert.equal(replayed[0]!.event, 'handoff.updated');
     assert.ok(replayed[0]!.id > lastA);
+
+    // 6. 워커 직접 메시지 전송 엔드포인트 및 취소 엔드포인트 확인
+    const detailA = await (await fetch(`${srv.baseUrl}/api/projects/${idA}`, { headers: authHeaders })).json() as {
+      snapshot: { workers: Array<{ workerId: string }> };
+    };
+    const workerAId = detailA.snapshot.workers[0]!.workerId;
+    const directSse = readSseUntil(
+      `${srv.baseUrl}/api/projects/${idA}/events?token=${srv.token}&afterSeq=${replayed[0]!.id}`,
+      {},
+      evs => evs.some(e => e.event === 'request.finished' && (e.data.payload as { requestId?: string }).requestId === 'direct-srv-1'),
+    );
+    const directRes = await fetch(`${srv.baseUrl}/api/projects/${idA}/workers/${workerAId}/messages`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ requestId: 'direct-srv-1', prompt: '직접 메시지' }),
+    });
+    assert.equal(directRes.status, 202);
+    const directEvents = await directSse;
+    assert.ok(directEvents.some(e => e.event === 'request.finished'));
+    const directGet = await (await fetch(`${srv.baseUrl}/api/projects/${idA}/requests/direct-srv-1`, { headers: authHeaders })).json() as {
+      request: { mode: string; status: string; finalText: string };
+    };
+    assert.equal(directGet.request.mode, 'direct_worker');
+    assert.equal(directGet.request.status, 'completed');
+    assert.match(directGet.request.finalText, /C:\\srv\\a/);
+
+    // 7. 존재하지 않는 대기 상태에 대한 /reply 409 및 /cancel 200 검증
+    const badReply = await fetch(`${srv.baseUrl}/api/projects/${idA}/requests/direct-srv-1/reply`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ replyKey: 'rk-bad', answer: '답변' }),
+    });
+    assert.equal(badReply.status, 409);
+    const cancelCompleted = await fetch(`${srv.baseUrl}/api/projects/${idA}/requests/direct-srv-1/cancel`, {
+      method: 'POST',
+      headers: authHeaders,
+    });
+    assert.equal(cancelCompleted.status, 200);
   } finally {
     await srv.close();
     await manager.shutdownAll().catch(() => {});
