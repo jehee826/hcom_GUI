@@ -8,7 +8,7 @@ export interface Participant { projectId: string; name: string; sessionId: strin
 export interface ActiveParticipant extends Participant { baseName: string; directory: string; hooksBound: boolean; processBound: boolean }
 export interface StoppedParticipant { projectId: string; name: string; tool: string; sessionId: string; directory: string }
 export interface WorkerLaunch { readonly name: string; readonly batchId: string; readonly readiness: 'ready' | 'starting' | 'needs_attention' }
-export type WorkerLaunchOptions = string | { settingsPath?: string; cwd?: string };
+export type WorkerLaunchOptions = string | { settingsPath?: string; cwd?: string; model?: string; effort?: string };
 export interface WorkerBinding extends Participant { evidence: 'hcom-managed-binding'; hooksBound: true; processBound: true; directory: string }
 export interface Receipt { eventId: number; deliveredTo: string[] }
 export interface HcomEvent { projectId: string; id: number; type: string; instance?: string; data: Record<string, unknown> }
@@ -24,12 +24,21 @@ function nonempty(value: string): string {
   if (!value.trim() || /[\r\n\0]/.test(value)) throw new Error('유효하지 않은 세션 ID');
   return value;
 }
-function workerSettingsArgs(settingsPath?: string): string[] {
-  if (!settingsPath) return [];
-  if (!(isAbsolute(settingsPath) || win32.isAbsolute(settingsPath))) throw new Error('워커 설정은 절대 경로여야 합니다');
-  return ['--', '--settings', settingsPath];
+function workerPassThroughArgs(options: { settingsPath?: string; model?: string; effort?: string }): string[] {
+  const args: string[] = [];
+  if (options.settingsPath) {
+    if (!(isAbsolute(options.settingsPath) || win32.isAbsolute(options.settingsPath))) throw new Error('워커 설정은 절대 경로여야 합니다');
+    args.push('--settings', options.settingsPath);
+  }
+  if (options.model?.trim()) {
+    args.push('--model', options.model.trim());
+  }
+  if (options.effort?.trim()) {
+    args.push('--effort', options.effort.trim());
+  }
+  return args.length > 0 ? ['--', ...args] : [];
 }
-function normalizeWorkerOptions(options?: WorkerLaunchOptions): { settingsPath?: string; cwd?: string } {
+function normalizeWorkerOptions(options?: WorkerLaunchOptions): { settingsPath?: string; cwd?: string; model?: string; effort?: string } {
   if (!options) return {};
   if (typeof options === 'string') return { settingsPath: options };
   if (options.cwd !== undefined && !(isAbsolute(options.cwd) || win32.isAbsolute(options.cwd))) {
@@ -138,9 +147,9 @@ export class HcomAdapter {
   }
   async launchWorker(options?: WorkerLaunchOptions): Promise<WorkerLaunch> {
     this.requireReady();
-    const { settingsPath, cwd } = normalizeWorkerOptions(options);
-    const dirArgs = cwd && !samePath(cwd, this.scope.cwd) ? ['--dir', cwd] : [];
-    return this.startWorker(['agy', '--headless', '--json', '--go', ...dirArgs, ...workerSettingsArgs(settingsPath)], undefined, cwd);
+    const norm = normalizeWorkerOptions(options);
+    const dirArgs = norm.cwd && !samePath(norm.cwd, this.scope.cwd) ? ['--dir', norm.cwd] : [];
+    return this.startWorker(['agy', '--headless', '--json', '--go', ...dirArgs, ...workerPassThroughArgs(norm)], undefined, norm.cwd);
   }
   private async startWorker(args: string[], expectedName?: string, cwd?: string): Promise<WorkerLaunch> {
     const result = await this.runner(args, { ...this.env }, cwd ?? this.scope.cwd);
@@ -263,9 +272,9 @@ export class HcomAdapter {
   async resumeWorker(worker: WorkerBinding, options?: WorkerLaunchOptions): Promise<WorkerLaunch> {
     this.requireReady(); this.check(worker);
     await this.verifyStopped(worker);
-    const { settingsPath, cwd } = normalizeWorkerOptions(options);
-    const dirArgs = cwd && !samePath(cwd, worker.directory) ? ['--dir', cwd] : [];
-    return this.startWorker(['r', worker.name, '--headless', '--json', '--go', ...dirArgs, ...workerSettingsArgs(settingsPath)], worker.name, cwd ?? worker.directory);
+    const norm = normalizeWorkerOptions(options);
+    const dirArgs = norm.cwd && !samePath(norm.cwd, worker.directory) ? ['--dir', norm.cwd] : [];
+    return this.startWorker(['r', worker.name, '--headless', '--json', '--go', ...dirArgs, ...workerPassThroughArgs(norm)], worker.name, norm.cwd ?? worker.directory);
   }
   async verifyResumedWorker(worker: WorkerBinding, expectedCwd?: string): Promise<WorkerBinding> {
     const current = await this.probeWorker(worker.name, expectedCwd ?? worker.directory);
@@ -282,6 +291,21 @@ export class HcomAdapter {
       lines: Array.isArray(data.lines) ? data.lines.map(line => typeof line === 'string' ? line : '') : [],
       cursorRow: Array.isArray(data.cursor) && Number.isSafeInteger(data.cursor[0]) ? data.cursor[0] as number : undefined,
     };
+  }
+  async injectInput(name: string, text: string): Promise<void> {
+    this.requireReady(); identity(name);
+    await this.command(['term', 'inject', name, text]);
+  }
+  async readTranscript(name: string, last = 8): Promise<unknown> {
+    this.requireReady(); identity(name);
+    const count = Math.max(1, Math.min(30, Math.floor(last)));
+    const result = await this.runner(['transcript', name, '--last', String(count), '--detailed', '--json'], { ...this.env }, this.scope.cwd);
+    if (result.code !== 0) return [];
+    try {
+      return JSON.parse(result.stdout);
+    } catch {
+      return result.stdout.trim() ? [{ text: result.stdout.trim() }] : [];
+    }
   }
   // agy 1.5.18 시작 공지 배너가 프롬프트를 밀어낼 때 구분선·단축키 안내가 입력칸에 겹친다.
   async clearBannerOverlay(name: string): Promise<boolean> {

@@ -52,6 +52,11 @@ function resolveCodexModel(): string | undefined {
   return trimmed;
 }
 
+function resolveCodexEffort(): string | undefined {
+  const raw = process.env.HCOM_GUI_EFFORT?.trim();
+  return raw || undefined;
+}
+
 function resolveCodexSandbox(): CodexSandboxMode {
   const raw = process.env.HCOM_GUI_CODEX_SANDBOX?.trim();
   if (raw === 'read-only' || raw === 'workspace-write' || raw === 'danger-full-access') {
@@ -178,6 +183,7 @@ async function startApp(): Promise<void> {
     dataDir,
     codexCommand,
     model: codexModel,
+    codexEffort: resolveCodexEffort(),
     codexSandbox: resolveCodexSandbox(),
     workerSettings,
   });

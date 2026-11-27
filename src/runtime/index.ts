@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { CodexSession, type CodexSandboxMode, type DynamicTool, type SessionOptions, type ToolOutput, type ToolResult, type TurnResult } from '../codex/index.ts';
+import { CodexSession, type CodexSandboxMode, type DynamicTool, type Progress, type SessionOptions, type ToolOutput, type ToolResult, type TurnResult } from '../codex/index.ts';
 import {
   HcomAdapter,
   isJammedTerminal,
@@ -23,9 +23,13 @@ import {
   type CodexSessionRecord,
   type DelegationRecord,
   type HandoffRecord,
+  type PendingApprovalRecord,
+  type ProgressLogEntry,
   type ProjectEventRecord,
   type ProjectRecord,
   type RequestRecord,
+  type StoredCodexSandboxMode,
+  type WorkerPermissionMode,
   type WorkerRecord,
   type WorkerSessionStatus,
 } from '../store/index.ts';
@@ -35,6 +39,7 @@ export interface CodexClient {
   startThread(): Promise<string>;
   resumeThread(threadId: string): Promise<string>;
   runTurn(input: { text: string } | { toolOutput: ToolOutput }): Promise<TurnResult>;
+  setRuntimeConfig?(patch: { model?: string | null; effort?: string | null; sandbox?: CodexSandboxMode }): void;
   close(): Promise<void>;
 }
 
@@ -55,9 +60,20 @@ export interface HcomClient {
   settleWorker(name: string, timeoutMs?: number): Promise<boolean>;
   clearBannerOverlay(name: string): Promise<boolean>;
   readTerminal(name: string): Promise<TerminalState>;
+  injectInput?(name: string, text: string): Promise<void>;
+  readTranscript?(name: string, last?: number): Promise<unknown>;
   clearJammedInput(name: string, requestId: number): Promise<boolean>;
   send(sender: Participant, target: Participant, text: string): Promise<Receipt>;
   follow(afterId: number, onEvent: (event: HcomEvent) => void, onError: (error: Error) => void): () => Promise<void>;
+}
+
+export interface LiveProgressEvent {
+  readonly projectId: string;
+  readonly kind: 'request.progress' | 'worker.progress';
+  readonly requestId?: string;
+  readonly workerId?: string;
+  readonly entry: ProgressLogEntry;
+  readonly totalEntries: number;
 }
 
 export interface ProjectManagerOptions {
@@ -65,11 +81,13 @@ export interface ProjectManagerOptions {
   readonly store?: ProjectStore;
   readonly codexCommand: string;
   readonly model?: string;
+  readonly codexEffort?: string;
   readonly codexSandbox?: CodexSandboxMode;
   readonly env?: NodeJS.ProcessEnv;
   readonly workerSettings?: Record<string, unknown>;
   readonly replyTimeoutMs?: number;
   readonly pollIntervalMs?: number;
+  readonly approvalDebounceMs?: number;
   readonly maxDelegationRounds?: number;
   readonly git?: GitInspector;
   readonly createCodex?: (options: SessionOptions) => Promise<CodexClient>;
@@ -88,7 +106,23 @@ export interface AddWorkerInput {
   readonly name: string;
   readonly requestKey: string;
   readonly cwd?: string;
+  readonly model?: string | null;
+  readonly reasoningEffort?: string | null;
+  readonly permissionMode?: WorkerPermissionMode;
   readonly start?: boolean;
+}
+
+export interface UpdateCodexSettingsInput {
+  readonly model?: string | null;
+  readonly reasoningEffort?: string | null;
+  readonly sandboxMode?: StoredCodexSandboxMode;
+}
+
+export interface UpdateWorkerSettingsInput {
+  readonly model?: string | null;
+  readonly reasoningEffort?: string | null;
+  readonly permissionMode?: WorkerPermissionMode;
+  readonly applyNow?: boolean;
 }
 
 export interface HandoffUpdateInput {
@@ -166,6 +200,8 @@ interface ProjectRuntime {
   readonly launches: Map<string, WorkerLaunch>;
   readonly bindings: Map<string, WorkerBinding>;
   readonly events: HcomEvent[];
+  readonly eventWaiters: Set<() => void>;
+  participantsCache?: { items: ActiveParticipant[]; cachedAt: number };
   eventError?: Error;
   stopFollow?: () => Promise<void>;
   activeRequest?: ActiveRequestState;
@@ -176,7 +212,7 @@ const delegateTools: DynamicTool[] = [
   {
     type: 'function',
     name: 'list_workers',
-    description: '현재 프로젝트의 hcom_gui 관리 워커(Antigravity/agy) 목록과 상태를 조회한다. 셸에서 agy나 hcom list를 직접 실행하지 말고 반드시 이 도구로 워커를 확인한다.',
+    description: '현재 프로젝트의 hcom_gui 관리 워커(Antigravity/agy) 목록과 상태·모델·권한을 조회한다. 반환되는 모든 워커가 Antigravity(agy) 워커이며, 셸에서 agy나 hcom list를 직접 실행하지 말고 반드시 이 도구로 워커를 확인한다.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -186,7 +222,7 @@ const delegateTools: DynamicTool[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        workerId: { type: 'string', description: '위임할 현재 프로젝트 소속 워커 ID' },
+        workerId: { type: 'string', description: '위임할 현재 프로젝트 소속 Antigravity(agy) 워커 ID' },
         task: { type: 'string', description: '워커에게 전달할 작업 또는 보완 재지시 내용' },
       },
       required: ['workerId', 'task'],
@@ -196,7 +232,7 @@ const delegateTools: DynamicTool[] = [
   {
     type: 'function',
     name: 'ask_user',
-    description: '요구사항이나 설계·권한 등 사용자 판단이 필요할 때 질문을 표시하고 답변을 대기한다. 사용자가 답변하면 같은 요청에서 이어서 진행한다.',
+    description: '원격 저장소 유무 확인, 요구사항·설계 선택, 권한 판단 등 사용자 확인이 필요할 때 일반 텍스트로 턴을 끝내지 말고 반드시 이 도구를 호출해 질문을 표시하고 답변을 대기한다. 사용자가 답변하면 같은 요청에서 이어서 진행한다.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -236,6 +272,10 @@ export class ProjectManager {
   private readonly locks = new KeyedLock();
   private readonly runtimes = new Map<string, ProjectRuntime>();
   private readonly eventSubscribers = new Set<(event: ProjectEventRecord) => void>();
+  private readonly liveSubscribers = new Set<(event: LiveProgressEvent) => void>();
+  private readonly requestProgress = new Map<string, ProgressLogEntry[]>();
+  private readonly workerProgress = new Map<string, ProgressLogEntry[]>();
+  private readonly lastLiveEmitAt = new Map<string, number>();
 
   constructor(options: ProjectManagerOptions) {
     this.dataDir = options.dataDir;
@@ -337,12 +377,198 @@ export class ProjectManager {
     return () => { this.eventSubscribers.delete(listener); };
   }
 
+  subscribeLive(listener: (event: LiveProgressEvent) => void): () => void {
+    this.liveSubscribers.add(listener);
+    return () => { this.liveSubscribers.delete(listener); };
+  }
+
   private emitEvent(projectId: string, kind: string, payload: Record<string, unknown>): ProjectEventRecord {
     const saved = this.store.appendEvent(projectId, kind, payload);
     for (const listener of this.eventSubscribers) {
       try { listener(saved); } catch {}
     }
     return saved;
+  }
+
+  private pushRequestProgress(projectId: string, requestId: string, entry: ProgressLogEntry, mergeSameKind = false): void {
+    const key = `${projectId}:${requestId}`;
+    let list = this.requestProgress.get(key);
+    if (!list) {
+      list = [];
+      this.requestProgress.set(key, list);
+    }
+    const last = list.at(-1);
+    if (mergeSameKind && last && last.source === entry.source && last.kind === entry.kind) {
+      const mergedDetail = `${last.detail ?? last.summary}${entry.detail ?? entry.summary}`.slice(-6000);
+      const firstLine = mergedDetail.split('\n').map(s => s.trim()).filter(Boolean).at(-1) ?? entry.summary;
+      list[list.length - 1] = {
+        ...last,
+        ts: entry.ts,
+        summary: firstLine.slice(0, 140),
+        detail: mergedDetail,
+      };
+    } else {
+      list.push(entry);
+      if (list.length > 200) list.splice(0, list.length - 200);
+    }
+    const now = Date.now();
+    const throttleKey = `req:${key}`;
+    const prevAt = this.lastLiveEmitAt.get(throttleKey) ?? 0;
+    if (mergeSameKind && now - prevAt < 80) return;
+    this.lastLiveEmitAt.set(throttleKey, now);
+    const currentEntry = list.at(-1)!;
+    const liveEvent: LiveProgressEvent = {
+      projectId,
+      kind: 'request.progress',
+      requestId,
+      entry: currentEntry,
+      totalEntries: list.length,
+    };
+    for (const listener of this.liveSubscribers) {
+      try { listener(liveEvent); } catch {}
+    }
+  }
+
+  private pushWorkerProgress(projectId: string, workerId: string, entry: ProgressLogEntry): void {
+    const key = `${projectId}:${workerId}`;
+    let list = this.workerProgress.get(key);
+    if (!list) {
+      list = [];
+      this.workerProgress.set(key, list);
+    }
+    const last = list.at(-1);
+    if (last && last.kind === entry.kind && last.summary === entry.summary && last.detail === entry.detail) return;
+    list.push(entry);
+    if (list.length > 120) list.splice(0, list.length - 120);
+    const liveEvent: LiveProgressEvent = {
+      projectId,
+      kind: 'worker.progress',
+      workerId,
+      entry,
+      totalEntries: list.length,
+    };
+    for (const listener of this.liveSubscribers) {
+      try { listener(liveEvent); } catch {}
+    }
+  }
+
+  getRequestProgress(projectId: string, requestId: string): ProgressLogEntry[] {
+    const mem = this.requestProgress.get(`${projectId}:${requestId}`);
+    if (mem && mem.length > 0) return [...mem];
+    return this.store.getRequest(projectId, requestId)?.progressSummary ?? [];
+  }
+
+  getAllRequestProgress(projectId: string): Record<string, ProgressLogEntry[]> {
+    const out: Record<string, ProgressLogEntry[]> = {};
+    for (const req of this.store.listRequests(projectId)) {
+      const entries = this.getRequestProgress(projectId, req.requestId);
+      if (entries.length > 0) out[req.requestId] = entries;
+    }
+    return out;
+  }
+
+  async getWorkerLogs(projectId: string, workerId: string, last = 8): Promise<{ progress: ProgressLogEntry[]; transcript: unknown }> {
+    this.requireProject(projectId);
+    const worker = this.assertWorkerBelongsToProject(projectId, workerId);
+    const progress = [...(this.workerProgress.get(`${projectId}:${workerId}`) ?? [])];
+    let transcript: unknown = [];
+    if (worker.hcomName) {
+      const runtime = this.runtimes.get(projectId) ?? await this.ensureRuntime(projectId, false);
+      if (runtime.hcom.readTranscript) {
+        transcript = await runtime.hcom.readTranscript(worker.hcomName, last).catch(() => []);
+      }
+    }
+    return { progress, transcript };
+  }
+
+  private snapshotRequestProgress(projectId: string, requestId: string): ProgressLogEntry[] {
+    const mem = this.requestProgress.get(`${projectId}:${requestId}`);
+    if (!mem || mem.length === 0) return this.store.getRequest(projectId, requestId)?.progressSummary ?? [];
+    return mem.slice(-40).map(entry => ({
+      ...entry,
+      ...(entry.detail && entry.detail.length > 1500 ? { detail: `${entry.detail.slice(0, 1500)}…` } : {}),
+    }));
+  }
+
+  updateCodexSettings(projectId: string, input: UpdateCodexSettingsInput): CodexSessionRecord {
+    this.requireProject(projectId);
+    const updated = this.store.updateCodexSession(projectId, {
+      ...(input.model !== undefined ? { model: input.model?.trim() || null } : {}),
+      ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort?.trim() || null } : {}),
+      ...(input.sandboxMode !== undefined ? { sandboxMode: input.sandboxMode } : {}),
+    });
+    const runtime = this.runtimes.get(projectId);
+    runtime?.codex?.setRuntimeConfig?.({
+      model: updated.model ?? this.options.model ?? null,
+      effort: updated.reasoningEffort ?? this.options.codexEffort ?? null,
+      sandbox: updated.sandboxMode,
+    });
+    this.emitEvent(projectId, 'codex.settings_updated', {
+      model: updated.model,
+      reasoningEffort: updated.reasoningEffort,
+      sandboxMode: updated.sandboxMode,
+    });
+    return updated;
+  }
+
+  async updateWorkerSettings(projectId: string, workerId: string, input: UpdateWorkerSettingsInput): Promise<WorkerRecord> {
+    this.requireProject(projectId);
+    this.assertWorkerBelongsToProject(projectId, workerId);
+    const before = this.assertWorkerBelongsToProject(projectId, workerId);
+    const updated = this.store.updateWorker(projectId, workerId, {
+      ...(input.model !== undefined ? { model: input.model?.trim() || null } : {}),
+      ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort?.trim() || null } : {}),
+      ...(input.permissionMode !== undefined ? { permissionMode: input.permissionMode } : {}),
+    });
+    const runtime = this.runtimes.get(projectId);
+    if (runtime) {
+      await this.writeWorkerSettingsFile(projectId, this.workerSettingsPathFor(projectId, updated), [updated.cwd], updated.permissionMode);
+    }
+    this.emitEvent(projectId, 'worker.settings_updated', {
+      workerId,
+      model: updated.model,
+      reasoningEffort: updated.reasoningEffort,
+      permissionMode: updated.permissionMode,
+    });
+    if (input.applyNow && (before.status === 'ready' || before.status === 'needs_attention')) {
+      await this.stopWorker(projectId, workerId).catch(() => {});
+      return this.startWorker(projectId, workerId);
+    }
+    return updated;
+  }
+
+  async resolveWorkerApproval(projectId: string, requestId: string, decision: 'approve' | 'deny'): Promise<RequestRecord> {
+    this.requireProject(projectId);
+    const req = this.store.getRequest(projectId, requestId);
+    if (!req) throw new Error(`요청을 찾을 수 없습니다: ${projectId}/${requestId}`);
+    if (req.status !== 'waiting_approval' || !req.pendingApproval) {
+      throw new Error(`승인 대기 상태가 아닌 요청입니다 (${req.status}).`);
+    }
+    const approval = req.pendingApproval;
+    const runtime = this.runtimes.get(projectId) ?? await this.ensureRuntime(projectId, false);
+    if (runtime.hcom.injectInput) {
+      await runtime.hcom.injectInput(approval.hcomName, decision === 'approve' ? '\r' : '\x1b');
+    }
+    const updated = this.store.updateRequest(projectId, requestId, {
+      status: 'worker_working',
+      pendingApproval: null,
+      error: null,
+    });
+    this.store.updateWorker(projectId, approval.workerId, { status: 'working', lastError: null });
+    this.pushRequestProgress(projectId, requestId, {
+      ts: new Date().toISOString(),
+      source: 'worker',
+      kind: 'approval',
+      summary: decision === 'approve' ? `워커(${approval.workerName}) 작업 승인됨` : `워커(${approval.workerName}) 작업 거절됨`,
+      detail: approval.detail,
+    });
+    this.emitEvent(projectId, 'request.approval_resolved', {
+      requestId,
+      workerId: approval.workerId,
+      decision,
+    });
+    this.notifyEventWaiters(runtime);
+    return updated;
   }
 
   listRequests(projectId: string): RequestRecord[] {
@@ -372,9 +598,18 @@ export class ProjectManager {
     return this.store.listWorkers(projectId);
   }
 
-  async listProjectHcomParticipants(projectId: string): Promise<ActiveParticipant[]> {
+  async listProjectHcomParticipants(projectId: string, forceRefresh = true): Promise<ActiveParticipant[]> {
     const runtime = await this.ensureRuntime(projectId);
-    return runtime.hcom.listParticipants();
+    if (!forceRefresh && runtime.participantsCache && Date.now() - runtime.participantsCache.cachedAt < 5000) {
+      return runtime.participantsCache.items;
+    }
+    const items = await runtime.hcom.listParticipants();
+    runtime.participantsCache = { items, cachedAt: Date.now() };
+    return items;
+  }
+
+  getCachedHcomParticipants(projectId: string): ActiveParticipant[] {
+    return this.runtimes.get(projectId)?.participantsCache?.items ?? [];
   }
 
   async startProject(projectId: string): Promise<ProjectSnapshot> {
@@ -402,6 +637,9 @@ export class ProjectManager {
         name: input.name,
         requestKey: input.requestKey,
         cwd: targetCwd,
+        model: input.model ?? null,
+        reasoningEffort: input.reasoningEffort ?? null,
+        permissionMode: input.permissionMode ?? 'always-proceed',
       });
       if (created) {
         this.emitEvent(projectId, 'worker.added', { workerId: worker.workerId, name: worker.name, cwd: worker.cwd });
@@ -460,7 +698,18 @@ export class ProjectManager {
       worker = this.store.updateWorker(projectId, workerId, { status: 'starting', lastError: null });
       let launch: WorkerLaunch | undefined;
       try {
-        await this.writeWorkerSettingsFile(projectId, runtime.settingsPath, [worker.cwd]);
+        const settingsPath = this.workerSettingsPathFor(projectId, worker);
+        await this.writeWorkerSettingsFile(projectId, settingsPath, [worker.cwd], worker.permissionMode);
+        if (!worker.isDefault) {
+          // 기본 agy-settings.json에도 추가 worktree 경로를 trustedWorkspaces로 동기화한다.
+          await this.writeWorkerSettingsFile(projectId, runtime.settingsPath, [worker.cwd]);
+        }
+        const launchOpts: WorkerLaunchOptions = {
+          settingsPath,
+          cwd: worker.cwd,
+          ...(worker.model ? { model: worker.model } : {}),
+          ...(worker.reasoningEffort ? { effort: worker.reasoningEffort } : {}),
+        };
         if (worker.conversationId && worker.hcomName) {
           this.assertConversationUnowned(projectId, workerId, worker.conversationId);
           const stopped = await runtime.hcom.getStoppedWorker(worker.hcomName);
@@ -478,9 +727,9 @@ export class ProjectManager {
             processBound: true,
             evidence: 'hcom-managed-binding',
           };
-          launch = await runtime.hcom.resumeWorker(binding, { settingsPath: runtime.settingsPath, cwd: worker.cwd });
+          launch = await runtime.hcom.resumeWorker(binding, launchOpts);
         } else {
-          launch = await runtime.hcom.launchWorker({ settingsPath: runtime.settingsPath, cwd: worker.cwd });
+          launch = await runtime.hcom.launchWorker(launchOpts);
         }
         runtime.launches.set(workerId, launch);
         await this.prepareWorkerLaunch(runtime.hcom, launch);
@@ -523,6 +772,7 @@ export class ProjectManager {
         status: 'ready',
         lastError: null,
       });
+      runtime.participantsCache = undefined;
       this.emitEvent(projectId, 'worker.started', { workerId, hcomName: launch.name, conversationId });
       return updated;
     });
@@ -838,7 +1088,15 @@ export class ProjectManager {
           requestEventId: receipt.eventId,
         });
 
-        const reply = await this.waitForWorkerReply(projectId, runtime, sender, target, receipt.eventId, abortController.signal);
+        const reply = await this.waitForWorkerReply(
+          projectId,
+          runtime,
+          sender,
+          target,
+          receipt.eventId,
+          abortController.signal,
+          { requestId, workerId, workerName: readyWorker.name },
+        );
         const replyText = String(reply.data.text).trim();
         const summaryText = summarizeWorkerReplyForCodex(replyText);
         const claimed = this.store.claimDelegationReply(projectId, delegation.delegationId, reply.id, replyText, summaryText);
@@ -850,6 +1108,8 @@ export class ProjectManager {
         this.store.updateWorker(projectId, workerId, { status: 'ready', lastError: null });
         const finalRecord = this.store.updateRequest(projectId, requestId, {
           status: 'completed',
+          pendingApproval: null,
+          progressSummary: this.snapshotRequestProgress(projectId, requestId),
           finalText: replyText,
           error: null,
         });
@@ -1003,6 +1263,8 @@ export class ProjectManager {
       status,
       pendingQuestion: null,
       pendingQuestionOptions: [],
+      pendingApproval: null,
+      progressSummary: this.snapshotRequestProgress(projectId, requestId),
       error: message,
     });
     this.store.updateCodexSession(projectId, { status: status === 'needs_attention' ? 'needs_attention' : 'ready', lastError: message });
@@ -1085,6 +1347,8 @@ export class ProjectManager {
               reviewTurnId: isReview ? turn.turnId : currentReq.reviewTurnId,
               pendingQuestion: asked.question,
               pendingQuestionOptions: asked.options,
+              pendingApproval: null,
+              progressSummary: this.snapshotRequestProgress(projectId, requestId),
               error: null,
             });
             this.store.updateCodexSession(projectId, { status: 'ready', lastError: null });
@@ -1111,6 +1375,8 @@ export class ProjectManager {
               reviewTurnId: isReview ? turn.turnId : this.store.getRequest(projectId, requestId)?.reviewTurnId ?? null,
               pendingQuestion: null,
               pendingQuestionOptions: [],
+              pendingApproval: null,
+              progressSummary: this.snapshotRequestProgress(projectId, requestId),
               finalText: turn.finalText ?? null,
               error: turn.reason ?? null,
             });
@@ -1178,6 +1444,7 @@ export class ProjectManager {
           pending.target,
           pending.receipt.eventId,
           abortController.signal,
+          { requestId, workerId: pending.worker.workerId, workerName: pending.worker.name },
         );
         const replyText = String(reply.data.text).trim();
         const summaryText = summarizeWorkerReplyForCodex(replyText);
@@ -1365,6 +1632,7 @@ export class ProjectManager {
         launches: new Map(),
         bindings: new Map(),
         events: [],
+        eventWaiters: new Set(),
         reconciled: false,
       };
       this.runtimes.set(projectId, runtime);
@@ -1391,10 +1659,12 @@ export class ProjectManager {
         seenEventIds.add(event.id);
         runtime.events.push(event);
         this.store.updateCursor(projectId, event.id);
-        this.handleHcomEvent(projectId, event);
+        this.handleHcomEvent(projectId, runtime, event);
+        this.notifyEventWaiters(runtime);
       },
       error => {
         runtime.eventError = error;
+        this.notifyEventWaiters(runtime);
         if (/DB가 교체/.test(error.message)) {
           this.store.markDbReset(projectId);
           this.emitEvent(projectId, 'hcom.db_reset', { error: error.message });
@@ -1403,7 +1673,14 @@ export class ProjectManager {
     );
   }
 
-  private handleHcomEvent(projectId: string, event: HcomEvent): void {
+  private notifyEventWaiters(runtime: ProjectRuntime): void {
+    for (const wake of runtime.eventWaiters) {
+      try { wake(); } catch {}
+    }
+    runtime.eventWaiters.clear();
+  }
+
+  private handleHcomEvent(projectId: string, runtime: ProjectRuntime, event: HcomEvent): void {
     if (event.type === 'message' && typeof event.data.from === 'string' && typeof event.data.text === 'string') {
       const senderKind = typeof event.data.sender_kind === 'string' ? event.data.sender_kind : '';
       if (senderKind === 'instance') {
@@ -1415,10 +1692,22 @@ export class ProjectManager {
           deliveredTo: Array.isArray(event.data.delivered_to) ? event.data.delivered_to : [],
           text: event.data.text,
         });
+        const senderWorker = this.store.findWorkerByHcomName(projectId, event.data.from);
+        if (senderWorker) {
+          const preview = event.data.text.replace(/\s+/g, ' ').trim().slice(0, 120);
+          this.pushWorkerProgress(projectId, senderWorker.workerId, {
+            ts: new Date().toISOString(),
+            source: 'worker',
+            kind: 'message',
+            summary: `회신 전송: ${preview}`,
+            detail: event.data.text,
+          });
+        }
       }
       return;
     }
     if (event.type !== 'status' || !event.instance) return;
+    runtime.participantsCache = undefined;
     const worker = this.store.findWorkerByHcomName(projectId, event.instance);
     if (!worker) return;
     const rawStatus = typeof event.data.status === 'string' ? event.data.status : '';
@@ -1436,10 +1725,29 @@ export class ProjectManager {
         return;
       }
     }
+    const context = typeof event.data.context === 'string' ? event.data.context : '';
+    const detail = typeof event.data.detail === 'string' ? event.data.detail : '';
+    const progressSummary = rawStatus === 'blocked'
+      ? `승인 대기 (${context || 'blocked'}): ${detail.replace(/\s+/g, ' ').trim().slice(0, 100)}`
+      : rawStatus === 'active'
+        ? `작업 중${context ? ` (${context})` : ''}${detail ? `: ${detail.replace(/\s+/g, ' ').trim().slice(0, 100)}` : ''}`
+        : `상태 전환: ${rawStatus}${context ? ` (${context})` : ''}`;
+    const entry: ProgressLogEntry = {
+      ts: new Date().toISOString(),
+      source: 'worker',
+      kind: rawStatus === 'blocked' ? 'approval' : 'status',
+      summary: progressSummary,
+      ...(detail ? { detail } : {}),
+    };
+    this.pushWorkerProgress(projectId, worker.workerId, entry);
+    if (runtime.activeRequest) {
+      this.pushRequestProgress(projectId, runtime.activeRequest.requestId, entry);
+    }
+
     const updated = this.store.updateWorker(projectId, worker.workerId, {
       status: mapped,
       ...(session && !worker.conversationId ? { conversationId: session } : {}),
-      lastError: mapped === 'needs_attention' ? String(event.data.detail ?? event.data.context ?? 'blocked') : null,
+      lastError: mapped === 'needs_attention' ? String(detail || context || 'blocked') : null,
     });
     if (updated.status !== worker.status || updated.conversationId !== worker.conversationId) {
       this.emitEvent(projectId, 'worker.status', {
@@ -1585,9 +1893,34 @@ export class ProjectManager {
     return participant;
   }
 
-  private async writeWorkerSettingsFile(projectId: string, settingsPath: string, extraPaths: readonly string[] = []): Promise<void> {
+  private workerSettingsPathFor(projectId: string, worker: WorkerRecord): string {
     const project = this.requireProject(projectId);
+    return worker.isDefault
+      ? join(project.hcomDir, 'agy-settings.json')
+      : join(project.hcomDir, `agy-settings-${worker.workerId}.json`);
+  }
+
+  private async writeWorkerSettingsFile(
+    projectId: string,
+    settingsPath: string,
+    extraPaths: readonly string[] = [],
+    permissionMode?: WorkerPermissionMode,
+  ): Promise<void> {
+    const project = this.requireProject(projectId);
+    const effectivePermission = permissionMode ?? this.store.getDefaultWorker(projectId)?.permissionMode ?? 'always-proceed';
     const base: Record<string, unknown> = { agentMode: '', ...(this.options.workerSettings ?? {}) };
+    if (effectivePermission === 'always-proceed') {
+      base.agentMode = '';
+      base.toolPermission = 'always-proceed';
+    } else if (effectivePermission === 'read-only') {
+      base.agentMode = 'plan';
+      delete base.toolPermission;
+    } else {
+      base.agentMode = '';
+      if (!this.options.workerSettings || !('toolPermission' in this.options.workerSettings)) {
+        delete base.toolPermission;
+      }
+    }
     const rawTrusted = base.trustedWorkspaces;
     const existingTrusted = Array.isArray(rawTrusted)
       ? rawTrusted.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
@@ -1609,16 +1942,95 @@ export class ProjectManager {
     await writeFile(settingsPath, payload, 'utf8');
   }
 
+  private handleCodexProgress(projectId: string, runtime: ProjectRuntime, event: Progress): void {
+    const active = runtime.activeRequest;
+    if (!active) return;
+    const method = event.method;
+    const params = event.params;
+    const now = new Date().toISOString();
+
+    if (method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') {
+      const delta = typeof params.delta === 'string' ? params.delta : '';
+      if (!delta) return;
+      this.pushRequestProgress(projectId, active.requestId, {
+        ts: now,
+        source: 'codex',
+        kind: 'reasoning',
+        summary: delta.replace(/\s+/g, ' ').trim().slice(0, 120) || '추론 중...',
+        detail: delta,
+      }, true);
+      return;
+    }
+
+    if (method === 'item/started' || method === 'item/completed') {
+      const item = params.item && typeof params.item === 'object' && !Array.isArray(params.item)
+        ? params.item as Record<string, unknown>
+        : undefined;
+      if (!item) return;
+      const itemType = typeof item.type === 'string' ? item.type : '';
+      if (itemType === 'reasoning' && method === 'item/completed') {
+        const summaryArr = Array.isArray(item.summary) ? item.summary.filter((s): s is string => typeof s === 'string') : [];
+        const text = summaryArr.join('\n').trim() || (typeof item.text === 'string' ? item.text.trim() : '');
+        if (!text) return;
+        this.pushRequestProgress(projectId, active.requestId, {
+          ts: now,
+          source: 'codex',
+          kind: 'reasoning_done',
+          summary: text.split('\n')[0]!.trim().slice(0, 140),
+          detail: text,
+        });
+      } else if (itemType === 'agentMessage' && item.phase === 'commentary' && typeof item.text === 'string' && item.text.trim()) {
+        const text = item.text.trim();
+        this.pushRequestProgress(projectId, active.requestId, {
+          ts: now,
+          source: 'codex',
+          kind: 'commentary',
+          summary: text.split('\n')[0]!.trim().slice(0, 140),
+          detail: text,
+        });
+      } else if (itemType === 'commandExecution') {
+        const cmd = typeof item.command === 'string' ? item.command : '';
+        const out = typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput.slice(0, 1500) : '';
+        this.pushRequestProgress(projectId, active.requestId, {
+          ts: now,
+          source: 'codex',
+          kind: method === 'item/started' ? 'command_start' : 'command_done',
+          summary: `${method === 'item/started' ? '명령 실행 중' : '명령 완료'}: ${cmd.slice(0, 100) || '(shell)'}`,
+          detail: out ? `$ ${cmd}\n${out}` : `$ ${cmd}`,
+        });
+      } else if (itemType === 'fileChange') {
+        this.pushRequestProgress(projectId, active.requestId, {
+          ts: now,
+          source: 'codex',
+          kind: 'file_change',
+          summary: method === 'item/started' ? '파일 변경 준비 중...' : '파일 변경 적용 완료',
+          detail: JSON.stringify(item.changes ?? item).slice(0, 1200),
+        });
+      } else if (itemType === 'dynamicToolCall' || itemType === 'mcpToolCall') {
+        const toolName = typeof item.tool === 'string' ? item.tool : (typeof item.name === 'string' ? item.name : itemType);
+        this.pushRequestProgress(projectId, active.requestId, {
+          ts: now,
+          source: 'codex',
+          kind: 'tool',
+          summary: `${method === 'item/started' ? '도구 호출 중' : '도구 완료'}: ${toolName}`,
+        });
+      }
+    }
+  }
+
   private async connectCodexForCwd(project: ProjectRecord, runtime: ProjectRuntime, cwd: string): Promise<CodexClient> {
+    const codexRec = this.store.getCodexSession(project.projectId);
     return this.createCodex({
       command: this.options.codexCommand,
       cwd,
-      model: this.options.model,
-      sandbox: this.options.codexSandbox ?? 'danger-full-access',
+      model: codexRec?.model ?? this.options.model,
+      effort: codexRec?.reasoningEffort ?? this.options.codexEffort,
+      sandbox: codexRec?.sandboxMode ?? this.options.codexSandbox ?? 'danger-full-access',
       env: this.options.env ?? process.env,
       hcomDir: project.hcomDir,
       dynamicTools: delegateTools,
       onToolCall: params => this.handleCodexToolCall(project.projectId, runtime, params),
+      onProgress: event => this.handleCodexProgress(project.projectId, runtime, event),
     });
   }
 
@@ -1629,9 +2041,14 @@ export class ProjectManager {
       const workers = this.store.listWorkers(projectId).map(worker => ({
         workerId: worker.workerId,
         name: worker.name,
+        tool: 'agy',
+        engine: 'Antigravity (agy)',
         isDefault: worker.isDefault,
         hcomName: worker.hcomName,
         status: worker.status,
+        model: worker.model,
+        reasoningEffort: worker.reasoningEffort,
+        permissionMode: worker.permissionMode,
         cwd: worker.cwd,
       }));
       return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(workers) }] };
@@ -1759,42 +2176,110 @@ export class ProjectManager {
     target: Participant,
     requestEventId: number,
     signal?: AbortSignal,
+    requestContext?: { requestId: string; workerId: string; workerName: string },
   ): Promise<HcomEvent> {
     const timeoutMs = this.options.replyTimeoutMs ?? 180_000;
-    const pollMs = this.options.pollIntervalMs ?? 1000;
-    const deadline = Date.now() + timeoutMs;
+    const approvalDebounceMs = this.options.approvalDebounceMs ?? 2500;
+    const basePollMs = this.options.pollIntervalMs ?? 2500;
+    const startedAt = Date.now();
+    const deadline = startedAt + timeoutMs;
     let jammedSince: number | undefined;
-    for (let tick = 0; Date.now() < deadline; tick++) {
+    let blockedSince: number | undefined;
+    let nextTermCheckAt = startedAt + 6000;
+    let termBackoffMs = 4000;
+
+    while (Date.now() < deadline) {
       if (signal?.aborted) throw new RequestCancelledError();
       if (runtime.eventError) throw runtime.eventError;
       const found = runtime.events.find(event => isWorkerReply(event, projectId, sender, target, requestEventId));
-      if (found) return found;
+      if (found) {
+        if (requestContext) {
+          const req = this.store.getRequest(projectId, requestContext.requestId);
+          if (req?.status === 'waiting_approval') {
+            this.store.updateRequest(projectId, requestContext.requestId, { status: 'worker_working', pendingApproval: null });
+          }
+        }
+        return found;
+      }
+
       const status = runtime.events.findLast(event => event.id > requestEventId && event.type === 'status' && event.instance === target.name);
       if (status?.data.status === 'blocked') {
-        throw new Error(`워커가 대기 상태로 중단됐습니다 (${String(status.data.context ?? 'blocked')}): ${String(status.data.detail ?? '')}`);
+        const context = String(status.data.context ?? 'blocked');
+        const detail = String(status.data.detail ?? '');
+        if (!requestContext) {
+          throw new Error(`워커가 대기 상태로 중단됐습니다 (${context}): ${detail}`);
+        }
+        blockedSince ??= Date.now();
+        if (Date.now() - blockedSince >= approvalDebounceMs) {
+          const req = this.store.getRequest(projectId, requestContext.requestId);
+          if (req && req.status !== 'waiting_approval') {
+            const pendingApproval: PendingApprovalRecord = {
+              workerId: requestContext.workerId,
+              workerName: requestContext.workerName,
+              hcomName: target.name,
+              context,
+              detail,
+              detectedAt: new Date().toISOString(),
+            };
+            this.store.updateRequest(projectId, requestContext.requestId, {
+              status: 'waiting_approval',
+              pendingApproval,
+              error: null,
+            });
+            this.emitEvent(projectId, 'request.waiting_approval', {
+              requestId: requestContext.requestId,
+              ...pendingApproval,
+            });
+          }
+        }
+      } else {
+        blockedSince = undefined;
+        if (requestContext) {
+          const req = this.store.getRequest(projectId, requestContext.requestId);
+          if (req?.status === 'waiting_approval') {
+            this.store.updateRequest(projectId, requestContext.requestId, {
+              status: 'worker_working',
+              pendingApproval: null,
+            });
+          }
+        }
       }
+
       const started = runtime.events.some(event => event.id > requestEventId && event.type === 'status' && event.instance === target.name && event.data.status === 'active');
-      if (!started && tick % 2 === 1) {
+      const now = Date.now();
+      if (!started && now >= nextTermCheckAt) {
         await runtime.hcom.clearBannerOverlay(target.name).catch(() => false);
         const term = await runtime.hcom.readTerminal(target.name).catch(() => undefined);
         if (term && isJammedTerminal(term, requestEventId)) {
-          jammedSince ??= Date.now();
-          if (Date.now() - jammedSince >= 4000) {
+          jammedSince ??= now;
+          if (now - jammedSince >= 4000) {
             await runtime.hcom.clearJammedInput(target.name, requestEventId).catch(() => false);
             jammedSince = undefined;
           }
         } else {
           jammedSince = undefined;
         }
+        nextTermCheckAt = now + termBackoffMs;
+        termBackoffMs = Math.min(15_000, termBackoffMs * 2);
       }
+
+      const waitBudget = Math.min(
+        Math.max(10, deadline - Date.now()),
+        blockedSince !== undefined ? Math.min(200, Math.max(20, approvalDebounceMs - (Date.now() - blockedSince))) : basePollMs,
+      );
       await new Promise<void>(resolve => {
-        if (!signal) {
-          setTimeout(resolve, pollMs);
-          return;
-        }
-        const onAbort = () => { clearTimeout(timer); resolve(); };
-        const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, pollMs);
-        signal.addEventListener('abort', onAbort, { once: true });
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          runtime.eventWaiters.delete(finish);
+          signal?.removeEventListener('abort', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, waitBudget);
+        runtime.eventWaiters.add(finish);
+        signal?.addEventListener('abort', finish, { once: true });
       });
     }
     throw new WorkerTimeoutError('워커 결과 회신 시간 초과');

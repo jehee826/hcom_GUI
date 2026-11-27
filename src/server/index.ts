@@ -3,8 +3,9 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type { ProjectManager } from '../runtime/index.ts';
-import type { ProjectEventRecord } from '../store/index.ts';
+import type { ProjectEventRecord, StoredCodexSandboxMode, WorkerPermissionMode } from '../store/index.ts';
 import { runCliDiagnostics, type CliDiagnostics } from './diagnostics.ts';
+import { createModelCatalogLoader, type ModelCatalog } from './models.ts';
 
 export interface GuiServerOptions {
   readonly manager: ProjectManager;
@@ -14,6 +15,7 @@ export interface GuiServerOptions {
   readonly token?: string;
   readonly codexCommand?: string;
   readonly getDiagnostics?: () => CliDiagnostics;
+  readonly getModels?: (refresh?: boolean) => Promise<ModelCatalog>;
 }
 
 export interface GuiServerHandle {
@@ -46,7 +48,7 @@ function isAllowedOrigin(origin: string | undefined): boolean {
 function statusCodeForError(error: unknown): number {
   const message = error instanceof Error ? error.message : String(error);
   if (/등록되지 않은|찾을 수 없습니다/.test(message)) return 404;
-  if (/이미 같은 (?:Git 저장소|프로젝트 폴더)|진행 중인|답변 대기 상태가 아닌/.test(message)) return 409;
+  if (/이미 같은 (?:Git 저장소|프로젝트 폴더)|진행 중인|(?:답변|승인) 대기 상태가 아닌/.test(message)) return 409;
   if (/다른 프로젝트|다른 Git 저장소|재사용할 수 없습니다|프로젝트 밖/.test(message)) return 403;
   if (/필요합니다|비어 있습니다|절대 경로|상대 경로|유효하지 않은|지원하지 않습니다/.test(message)) return 400;
   return 500;
@@ -76,6 +78,7 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
   const token = options.token ?? randomBytes(24).toString('hex');
   const manager = options.manager;
   const diagnostics = options.getDiagnostics ?? (() => runCliDiagnostics(options.codexCommand));
+  const getModels = options.getModels ?? createModelCatalogLoader(options.codexCommand);
   const sseClients = new Set<Response>();
 
   app.disable('x-powered-by');
@@ -114,6 +117,16 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
 
   app.get('/api/diagnostics', (_req, res) => {
     res.json(diagnostics());
+  });
+
+  app.get('/api/models', async (req, res) => {
+    try {
+      const refresh = queryString(req.query.refresh) === '1' || queryString(req.query.refresh) === 'true';
+      const catalog = await getModels(refresh);
+      res.json(catalog);
+    } catch (error) {
+      sendError(res, error);
+    }
   });
 
   app.get('/api/projects', (_req, res) => {
@@ -159,14 +172,36 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
       const requests = manager.listRequests(projectId);
       const delegations = manager.listDelegations(projectId);
       const events = manager.listProjectEvents(projectId, 0);
-      const hcomParticipants = await manager.listProjectHcomParticipants(projectId).catch(() => []);
+      const progressByRequest = manager.getAllRequestProgress(projectId);
+      const hcomParticipants = manager.getCachedHcomParticipants(projectId);
       res.json({
         snapshot,
         requests,
         delegations,
+        progressByRequest,
         hcomParticipants,
         latestSeq: events.at(-1)?.seq ?? 0,
       });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  app.patch('/api/projects/:projectId/codex/settings', (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+      const rawSandbox = typeof body.sandboxMode === 'string' ? body.sandboxMode.trim() : undefined;
+      if (rawSandbox !== undefined && rawSandbox !== 'read-only' && rawSandbox !== 'workspace-write' && rawSandbox !== 'danger-full-access') {
+        res.status(400).json({ error: '유효하지 않은 Codex 권한 모드입니다.' });
+        return;
+      }
+      const codex = manager.updateCodexSettings(projectId, {
+        ...(body.model === null || typeof body.model === 'string' ? { model: body.model } : {}),
+        ...(body.reasoningEffort === null || typeof body.reasoningEffort === 'string' ? { reasoningEffort: body.reasoningEffort } : {}),
+        ...(rawSandbox ? { sandboxMode: rawSandbox as StoredCodexSandboxMode } : {}),
+      });
+      res.json({ codex });
     } catch (error) {
       sendError(res, error);
     }
@@ -198,9 +233,59 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
       const name = typeof body.name === 'string' ? body.name.trim() : '';
       const requestKey = typeof body.requestKey === 'string' ? body.requestKey.trim() : '';
       const cwd = typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd.trim() : undefined;
+      const model = body.model === null || typeof body.model === 'string' ? body.model : undefined;
+      const reasoningEffort = body.reasoningEffort === null || typeof body.reasoningEffort === 'string' ? body.reasoningEffort : undefined;
+      const rawPerm = typeof body.permissionMode === 'string' ? body.permissionMode.trim() : undefined;
+      if (rawPerm !== undefined && rawPerm !== 'always-proceed' && rawPerm !== 'ask' && rawPerm !== 'read-only') {
+        res.status(400).json({ error: '유효하지 않은 워커 권한 모드입니다.' });
+        return;
+      }
       const start = typeof body.start === 'boolean' ? body.start : true;
-      const worker = await manager.addWorker(projectId, { name, requestKey, cwd, start });
+      const worker = await manager.addWorker(projectId, {
+        name,
+        requestKey,
+        cwd,
+        model,
+        reasoningEffort,
+        permissionMode: rawPerm as WorkerPermissionMode | undefined,
+        start,
+      });
       res.status(201).json({ worker });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  app.patch('/api/projects/:projectId/workers/:workerId/settings', async (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const workerId = paramString(req.params.workerId);
+      const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+      const rawPerm = typeof body.permissionMode === 'string' ? body.permissionMode.trim() : undefined;
+      if (rawPerm !== undefined && rawPerm !== 'always-proceed' && rawPerm !== 'ask' && rawPerm !== 'read-only') {
+        res.status(400).json({ error: '유효하지 않은 워커 권한 모드입니다.' });
+        return;
+      }
+      const worker = await manager.updateWorkerSettings(projectId, workerId, {
+        ...(body.model === null || typeof body.model === 'string' ? { model: body.model } : {}),
+        ...(body.reasoningEffort === null || typeof body.reasoningEffort === 'string' ? { reasoningEffort: body.reasoningEffort } : {}),
+        ...(rawPerm ? { permissionMode: rawPerm as WorkerPermissionMode } : {}),
+        ...(typeof body.applyNow === 'boolean' ? { applyNow: body.applyNow } : {}),
+      });
+      res.json({ worker });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  app.get('/api/projects/:projectId/workers/:workerId/logs', async (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const workerId = paramString(req.params.workerId);
+      const rawLast = Number.parseInt(queryString(req.query.last) ?? '8', 10);
+      const last = Number.isSafeInteger(rawLast) && rawLast > 0 ? rawLast : 8;
+      const logs = await manager.getWorkerLogs(projectId, workerId, last);
+      res.json(logs);
     } catch (error) {
       sendError(res, error);
     }
@@ -344,6 +429,23 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
     }
   });
 
+  app.post('/api/projects/:projectId/requests/:requestId/approval', async (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const requestId = paramString(req.params.requestId);
+      const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+      const decision = body.decision === 'approve' || body.decision === 'deny' ? body.decision : undefined;
+      if (!decision) {
+        res.status(400).json({ error: 'decision은 approve 또는 deny여야 합니다.' });
+        return;
+      }
+      const request = await manager.resolveWorkerApproval(projectId, requestId, decision);
+      res.json({ request });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
   app.post('/api/projects/:projectId/requests/:requestId/cancel', async (req, res) => {
     try {
       const request = await manager.cancelRequest(paramString(req.params.projectId), paramString(req.params.requestId));
@@ -413,6 +515,10 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
         if (replaying) buffered.push(event);
         else writeEvent(event);
       });
+      const unsubscribeLive = manager.subscribeLive(liveEvent => {
+        if (liveEvent.projectId !== projectId || res.writableEnded) return;
+        res.write(`event: ${liveEvent.kind}\ndata: ${JSON.stringify(liveEvent)}\n\n`);
+      });
 
       for (const past of manager.listProjectEvents(projectId, afterSeq)) {
         writeEvent(past);
@@ -430,6 +536,7 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
       req.on('close', () => {
         clearInterval(heartbeat);
         unsubscribe();
+        unsubscribeLive();
         sseClients.delete(res);
       });
     } catch (error) {
