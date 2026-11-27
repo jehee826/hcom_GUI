@@ -8,6 +8,7 @@ export interface GitRepoInfo {
   readonly gitCommonDir: string;
   readonly gitCommonDirKey: string;
   readonly defaultName: string;
+  readonly isGitRepo?: boolean;
 }
 
 export interface GitSnapshot {
@@ -58,30 +59,51 @@ export function resolveGitProject(folderPath: string): GitRepoInfo {
   }
   if (!stats.isDirectory()) throw new Error(`폴더 경로가 아닙니다: ${folderPath}`);
 
-  let toplevelRaw: string;
-  let commonDirRaw: string;
+  let toplevelRaw: string | null = null;
+  let commonDirRaw: string | null = null;
   try {
     toplevelRaw = runGit(realFolder, ['rev-parse', '--path-format=absolute', '--show-toplevel']);
     commonDirRaw = runGit(realFolder, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Git 저장소 경로를 확인할 수 없습니다: ${detail}`);
+  } catch {
+    toplevelRaw = null;
+    commonDirRaw = null;
   }
 
-  const rootPath = canonicalizePath(toplevelRaw);
-  const gitCommonDir = canonicalizePath(commonDirRaw);
+  if (toplevelRaw && commonDirRaw) {
+    const rootPath = canonicalizePath(toplevelRaw);
+    const gitCommonDir = canonicalizePath(commonDirRaw);
+    return {
+      rootPath,
+      rootKey: normalizePathKey(rootPath),
+      gitCommonDir,
+      gitCommonDirKey: normalizePathKey(gitCommonDir),
+      defaultName: basename(rootPath) || rootPath,
+      isGitRepo: true,
+    };
+  }
+
+  // Git 저장소가 아닌 일반 폴더도 프로젝트로 등록한다.
+  const rootKey = normalizePathKey(realFolder);
   return {
-    rootPath,
-    rootKey: normalizePathKey(rootPath),
-    gitCommonDir,
-    gitCommonDirKey: normalizePathKey(gitCommonDir),
-    defaultName: basename(rootPath) || rootPath,
+    rootPath: realFolder,
+    rootKey,
+    gitCommonDir: realFolder,
+    gitCommonDirKey: `dir:${rootKey}`,
+    defaultName: basename(realFolder) || realFolder,
+    isGitRepo: false,
   };
 }
 
 export function readGitSnapshot(cwd: string): GitSnapshot {
   if (!isAbsolutePath(cwd)) return { branchStatus: '확인 필요', commitStatus: '확인 필요' };
   const realCwd = canonicalizePath(cwd);
+
+  try {
+    const inside = runGit(realCwd, ['rev-parse', '--is-inside-work-tree']);
+    if (inside !== 'true') return { branchStatus: 'Git 없음', commitStatus: 'Git 없음' };
+  } catch {
+    return { branchStatus: 'Git 없음', commitStatus: 'Git 없음' };
+  }
 
   let branchStatus = '확인 필요';
   try {

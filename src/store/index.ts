@@ -5,8 +5,28 @@ import { DatabaseSync } from 'node:sqlite';
 
 export type CodexSessionStatus = 'stopped' | 'starting' | 'ready' | 'running' | 'needs_attention' | 'disconnected' | 'error';
 export type WorkerSessionStatus = 'stopped' | 'starting' | 'ready' | 'working' | 'needs_attention' | 'disconnected' | 'error';
-export type RequestStatus = 'accepted' | 'codex_running' | 'worker_working' | 'codex_reviewing' | 'completed' | 'failed' | 'interrupted' | 'needs_attention' | 'needs_verification';
-export type DelegationStatus = 'sent' | 'replied' | 'reviewed' | 'failed' | 'needs_attention';
+export type RequestMode = 'codex' | 'direct_worker';
+export type RequestStatus =
+  | 'accepted'
+  | 'codex_running'
+  | 'worker_working'
+  | 'codex_reviewing'
+  | 'waiting_user'
+  | 'completed'
+  | 'failed'
+  | 'timed_out'
+  | 'cancelled'
+  | 'interrupted'
+  | 'needs_attention'
+  | 'needs_verification';
+export type DelegationStatus = 'sent' | 'replied' | 'reviewed' | 'failed' | 'timed_out' | 'cancelled' | 'needs_attention';
+
+export interface UserReplyEntry {
+  readonly replyKey: string;
+  readonly question: string;
+  readonly answer: string;
+  readonly createdAt: string;
+}
 
 export interface ProjectRecord {
   readonly projectId: string;
@@ -47,10 +67,16 @@ export interface WorkerRecord {
 export interface RequestRecord {
   readonly projectId: string;
   readonly requestId: string;
+  readonly mode: RequestMode;
+  readonly targetWorkerId: string | null;
   readonly prompt: string;
   readonly status: RequestStatus;
+  readonly round: number;
   readonly codexTurnId: string | null;
   readonly reviewTurnId: string | null;
+  readonly pendingQuestion: string | null;
+  readonly pendingQuestionOptions: string[];
+  readonly userReplies: UserReplyEntry[];
   readonly finalText: string | null;
   readonly error: string | null;
   readonly createdAt: string;
@@ -62,11 +88,14 @@ export interface DelegationRecord {
   readonly projectId: string;
   readonly requestId: string;
   readonly workerId: string;
+  readonly round: number;
   readonly toolCallId: string;
   readonly requestEventId: number | null;
   readonly replyEventId: number | null;
   readonly prompt: string;
   readonly replyText: string | null;
+  readonly summaryText: string | null;
+  readonly reviewedAt: string | null;
   readonly status: DelegationStatus;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -162,14 +191,48 @@ function mapWorker(row: Row): WorkerRecord {
   };
 }
 
+function parseStringArray(raw: unknown): string[] {
+  try {
+    const parsed: unknown = JSON.parse(asString(raw) || '[]');
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseUserReplies(raw: unknown): UserReplyEntry[] {
+  try {
+    const parsed: unknown = JSON.parse(asString(raw) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+      .map(item => ({
+        replyKey: asString(item.replyKey),
+        question: asString(item.question),
+        answer: asString(item.answer),
+        createdAt: asString(item.createdAt),
+      }))
+      .filter(item => item.replyKey.length > 0);
+  } catch {
+    return [];
+  }
+}
+
 function mapRequest(row: Row): RequestRecord {
+  const rawMode = asString(row.mode);
   return {
     projectId: asString(row.project_id),
     requestId: asString(row.request_id),
+    mode: rawMode === 'direct_worker' ? 'direct_worker' : 'codex',
+    targetWorkerId: asNullableString(row.target_worker_id),
     prompt: asString(row.prompt),
     status: asString(row.status) as RequestStatus,
+    round: row.round === undefined || row.round === null ? 0 : asNumber(row.round),
     codexTurnId: asNullableString(row.codex_turn_id),
     reviewTurnId: asNullableString(row.review_turn_id),
+    pendingQuestion: asNullableString(row.pending_question),
+    pendingQuestionOptions: parseStringArray(row.pending_question_options_json),
+    userReplies: parseUserReplies(row.user_replies_json),
     finalText: asNullableString(row.final_text),
     error: asNullableString(row.error),
     createdAt: asString(row.created_at),
@@ -183,11 +246,14 @@ function mapDelegation(row: Row): DelegationRecord {
     projectId: asString(row.project_id),
     requestId: asString(row.request_id),
     workerId: asString(row.worker_id),
+    round: row.round === undefined || row.round === null ? 1 : asNumber(row.round),
     toolCallId: asString(row.tool_call_id),
     requestEventId: asNullableNumber(row.request_event_id),
     replyEventId: asNullableNumber(row.reply_event_id),
     prompt: asString(row.prompt),
     replyText: asNullableString(row.reply_text),
+    summaryText: asNullableString(row.summary_text),
+    reviewedAt: asNullableString(row.reviewed_at),
     status: asString(row.status) as DelegationStatus,
     createdAt: asString(row.created_at),
     updatedAt: asString(row.updated_at),
@@ -371,6 +437,29 @@ export class ProjectStore {
       CREATE INDEX IF NOT EXISTS idx_project_events_project_seq
         ON project_events(project_id, seq);
     `);
+
+    // 기존 DB 업그레이드 호환을 위한 컬럼 마이그레이션
+    this.ensureColumn('requests', 'mode', "TEXT NOT NULL DEFAULT 'codex'");
+    this.ensureColumn('requests', 'target_worker_id', 'TEXT');
+    this.ensureColumn('requests', 'round', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('requests', 'pending_question', 'TEXT');
+    this.ensureColumn('requests', 'pending_question_options_json', "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn('requests', 'user_replies_json', "TEXT NOT NULL DEFAULT '[]'");
+
+    this.ensureColumn('delegations', 'round', 'INTEGER NOT NULL DEFAULT 1');
+    this.ensureColumn('delegations', 'summary_text', 'TEXT');
+    this.ensureColumn('delegations', 'reviewed_at', 'TEXT');
+
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_delegations_project_reply_event
+        ON delegations(project_id, reply_event_id) WHERE reply_event_id IS NOT NULL;
+    `);
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+    if (cols.some(col => asString(col.name) === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   private transaction<T>(fn: () => T): T {
@@ -387,9 +476,9 @@ export class ProjectStore {
 
   registerProject(input: RegisterProjectInput): { project: ProjectRecord; codex: CodexSessionRecord; defaultWorker: WorkerRecord; handoff: HandoffRecord } {
     return this.transaction(() => {
-      const existing = this.findProjectByCommonDir(input.gitCommonDirKey);
+      const existing = this.findProjectByCommonDir(input.gitCommonDirKey) ?? this.findProjectByRootPath(input.rootPath);
       if (existing) {
-        throw new Error(`이미 같은 Git 저장소가 등록되어 있습니다 (${existing.name}, projectId=${existing.projectId}).`);
+        throw new Error(`이미 같은 프로젝트 폴더가 등록되어 있습니다 (${existing.name}, projectId=${existing.projectId}).`);
       }
       const now = nowIso();
       const projectId = input.projectId ?? randomUUID();
@@ -442,6 +531,11 @@ export class ProjectStore {
   findProjectByCommonDir(gitCommonDirKey: string): ProjectRecord | undefined {
     const row = this.db.prepare('SELECT * FROM projects WHERE git_common_dir = ?').get(gitCommonDirKey) as Row | undefined;
     return row ? mapProject(row) : undefined;
+  }
+
+  findProjectByRootPath(rootPath: string): ProjectRecord | undefined {
+    const normalized = rootPath.replace(/[\\/]+$/, '').toLowerCase();
+    return this.listProjects().find(project => project.rootPath.replace(/[\\/]+$/, '').toLowerCase() === normalized);
   }
 
   getSelectedProjectId(): string | null {
@@ -586,7 +680,13 @@ export class ProjectStore {
     });
   }
 
-  acceptRequest(input: { projectId: string; requestId: string; prompt: string }): { request: RequestRecord; created: boolean } {
+  acceptRequest(input: {
+    projectId: string;
+    requestId: string;
+    prompt: string;
+    mode?: RequestMode;
+    targetWorkerId?: string | null;
+  }): { request: RequestRecord; created: boolean } {
     if (!input.requestId.trim()) throw new Error('요청 ID(requestId)가 필요합니다.');
     if (!input.prompt.trim()) throw new Error('요청 내용이 비어 있습니다.');
     return this.transaction(() => {
@@ -595,9 +695,13 @@ export class ProjectStore {
       if (existing) return { request: mapRequest(existing), created: false };
       const now = nowIso();
       this.db.prepare(`
-        INSERT INTO requests (project_id, request_id, prompt, status, codex_turn_id, review_turn_id, final_text, error, created_at, updated_at)
-        VALUES (?, ?, ?, 'accepted', NULL, NULL, NULL, NULL, ?, ?)
-      `).run(input.projectId, input.requestId, input.prompt, now, now);
+        INSERT INTO requests (
+          project_id, request_id, mode, target_worker_id, prompt, status, round,
+          codex_turn_id, review_turn_id, pending_question, pending_question_options_json,
+          user_replies_json, final_text, error, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'accepted', 0, NULL, NULL, NULL, '[]', '[]', NULL, NULL, ?, ?)
+      `).run(input.projectId, input.requestId, input.mode ?? 'codex', input.targetWorkerId ?? null, input.prompt, now, now);
       return { request: this.getRequest(input.projectId, input.requestId)!, created: true };
     });
   }
@@ -615,7 +719,17 @@ export class ProjectStore {
   updateRequest(
     projectId: string,
     requestId: string,
-    patch: Partial<{ status: RequestStatus; codexTurnId: string | null; reviewTurnId: string | null; finalText: string | null; error: string | null }>,
+    patch: Partial<{
+      status: RequestStatus;
+      round: number;
+      codexTurnId: string | null;
+      reviewTurnId: string | null;
+      pendingQuestion: string | null;
+      pendingQuestionOptions: string[];
+      userReplies: UserReplyEntry[];
+      finalText: string | null;
+      error: string | null;
+    }>,
   ): RequestRecord {
     return this.transaction(() => {
       const current = this.getRequest(projectId, requestId);
@@ -623,17 +737,36 @@ export class ProjectStore {
       const next: RequestRecord = {
         ...current,
         status: patch.status !== undefined ? patch.status : current.status,
+        round: patch.round !== undefined ? patch.round : current.round,
         codexTurnId: patch.codexTurnId !== undefined ? patch.codexTurnId : current.codexTurnId,
         reviewTurnId: patch.reviewTurnId !== undefined ? patch.reviewTurnId : current.reviewTurnId,
+        pendingQuestion: patch.pendingQuestion !== undefined ? patch.pendingQuestion : current.pendingQuestion,
+        pendingQuestionOptions: patch.pendingQuestionOptions !== undefined ? patch.pendingQuestionOptions : current.pendingQuestionOptions,
+        userReplies: patch.userReplies !== undefined ? patch.userReplies : current.userReplies,
         finalText: patch.finalText !== undefined ? patch.finalText : current.finalText,
         error: patch.error !== undefined ? patch.error : current.error,
         updatedAt: nowIso(),
       };
       this.db.prepare(`
         UPDATE requests
-        SET status = ?, codex_turn_id = ?, review_turn_id = ?, final_text = ?, error = ?, updated_at = ?
+        SET status = ?, round = ?, codex_turn_id = ?, review_turn_id = ?,
+            pending_question = ?, pending_question_options_json = ?, user_replies_json = ?,
+            final_text = ?, error = ?, updated_at = ?
         WHERE project_id = ? AND request_id = ?
-      `).run(next.status, next.codexTurnId, next.reviewTurnId, next.finalText, next.error, next.updatedAt, projectId, requestId);
+      `).run(
+        next.status,
+        next.round,
+        next.codexTurnId,
+        next.reviewTurnId,
+        next.pendingQuestion,
+        JSON.stringify(next.pendingQuestionOptions),
+        JSON.stringify(next.userReplies),
+        next.finalText,
+        next.error,
+        next.updatedAt,
+        projectId,
+        requestId,
+      );
       return next;
     });
   }
@@ -647,25 +780,72 @@ export class ProjectStore {
     return Boolean(row);
   }
 
-  createDelegation(input: { projectId: string; requestId: string; workerId: string; toolCallId: string; requestEventId: number; prompt: string }): DelegationRecord {
+  createDelegation(input: {
+    projectId: string;
+    requestId: string;
+    workerId: string;
+    round?: number;
+    toolCallId: string;
+    requestEventId: number;
+    prompt: string;
+  }): DelegationRecord {
     return this.transaction(() => {
       const worker = this.getWorker(input.projectId, input.workerId);
       if (!worker) throw new Error('다른 프로젝트 소속이거나 존재하지 않는 워커에는 위임 기록을 만들 수 없습니다.');
       const delegationId = randomUUID();
       const now = nowIso();
+      const round = input.round ?? (this.listDelegations(input.projectId, input.requestId).length + 1);
       this.db.prepare(`
-        INSERT INTO delegations (delegation_id, project_id, request_id, worker_id, tool_call_id, request_event_id, reply_event_id, prompt, reply_text, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'sent', ?, ?)
-      `).run(delegationId, input.projectId, input.requestId, input.workerId, input.toolCallId, input.requestEventId, input.prompt, now, now);
+        INSERT INTO delegations (
+          delegation_id, project_id, request_id, worker_id, round, tool_call_id,
+          request_event_id, reply_event_id, prompt, reply_text, summary_text, reviewed_at,
+          status, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, 'sent', ?, ?)
+      `).run(delegationId, input.projectId, input.requestId, input.workerId, round, input.toolCallId, input.requestEventId, input.prompt, now, now);
       const row = this.db.prepare('SELECT * FROM delegations WHERE delegation_id = ?').get(delegationId) as Row;
       return mapDelegation(row);
+    });
+  }
+
+  findDelegationByReplyEventId(projectId: string, replyEventId: number): DelegationRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM delegations WHERE project_id = ? AND reply_event_id = ?').get(projectId, replyEventId) as Row | undefined;
+    return row ? mapDelegation(row) : undefined;
+  }
+
+  claimDelegationReply(
+    projectId: string,
+    delegationId: string,
+    replyEventId: number,
+    replyText: string,
+    summaryText: string,
+  ): { claimed: boolean; delegation: DelegationRecord } {
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM delegations WHERE project_id = ? AND delegation_id = ?').get(projectId, delegationId) as Row | undefined;
+      if (!row) throw new Error(`위임 기록을 찾을 수 없습니다: ${projectId}/${delegationId}`);
+      const current = mapDelegation(row);
+      if (current.replyEventId !== null || current.reviewedAt !== null || current.status !== 'sent') {
+        return { claimed: false, delegation: current };
+      }
+      const duplicate = this.findDelegationByReplyEventId(projectId, replyEventId);
+      if (duplicate) {
+        return { claimed: false, delegation: duplicate };
+      }
+      const now = nowIso();
+      this.db.prepare(`
+        UPDATE delegations
+        SET reply_event_id = ?, reply_text = ?, summary_text = ?, status = 'replied', updated_at = ?
+        WHERE project_id = ? AND delegation_id = ? AND reply_event_id IS NULL AND status = 'sent'
+      `).run(replyEventId, replyText, summaryText, now, projectId, delegationId);
+      const updated = mapDelegation(this.db.prepare('SELECT * FROM delegations WHERE delegation_id = ?').get(delegationId) as Row);
+      return { claimed: updated.replyEventId === replyEventId, delegation: updated };
     });
   }
 
   updateDelegation(
     projectId: string,
     delegationId: string,
-    patch: Partial<{ replyEventId: number | null; replyText: string | null; status: DelegationStatus }>,
+    patch: Partial<{ replyEventId: number | null; replyText: string | null; summaryText: string | null; reviewedAt: string | null; status: DelegationStatus }>,
   ): DelegationRecord {
     return this.transaction(() => {
       const row = this.db.prepare('SELECT * FROM delegations WHERE project_id = ? AND delegation_id = ?').get(projectId, delegationId) as Row | undefined;
@@ -675,14 +855,16 @@ export class ProjectStore {
         ...current,
         replyEventId: patch.replyEventId !== undefined ? patch.replyEventId : current.replyEventId,
         replyText: patch.replyText !== undefined ? patch.replyText : current.replyText,
+        summaryText: patch.summaryText !== undefined ? patch.summaryText : current.summaryText,
+        reviewedAt: patch.reviewedAt !== undefined ? patch.reviewedAt : current.reviewedAt,
         status: patch.status !== undefined ? patch.status : current.status,
         updatedAt: nowIso(),
       };
       this.db.prepare(`
         UPDATE delegations
-        SET reply_event_id = ?, reply_text = ?, status = ?, updated_at = ?
+        SET reply_event_id = ?, reply_text = ?, summary_text = ?, reviewed_at = ?, status = ?, updated_at = ?
         WHERE project_id = ? AND delegation_id = ?
-      `).run(next.replyEventId, next.replyText, next.status, next.updatedAt, projectId, delegationId);
+      `).run(next.replyEventId, next.replyText, next.summaryText, next.reviewedAt, next.status, next.updatedAt, projectId, delegationId);
       return next;
     });
   }
