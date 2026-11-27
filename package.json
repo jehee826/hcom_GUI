@@ -1,20 +1,77 @@
 {
   "name": "hcom-gui",
   "version": "1.0.0",
+  "description": "프로젝트별 격리 AI 세션 워크스페이스 (Codex + hcom + Antigravity)",
+  "author": "hcom_gui",
   "private": true,
   "type": "module",
+  "main": "dist/electron/main.js",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "assets": "node scripts/generate-assets.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "build": "node scripts/build.ts",
+    "dist": "npm run build && electron-builder --win --x64 --publish never",
     "test": "node --test test/*.test.ts",
     "verify:roundtrip": "node scripts/verify-roundtrip.ts",
-    "verify:stage2": "node scripts/verify-stage2.ts"
+    "verify:stage2": "node scripts/verify-stage2.ts",
+    "verify:installed": "node scripts/verify-installed.ts"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "24.10.1",
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3",
     "typescript": "5.9.3"
   },
   "dependencies": {
     "express": "^5.3.0"
+  },
+  "build": {
+    "appId": "com.hcomgui.desktop",
+    "productName": "hcom_gui",
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json",
+      "!dist/**/*.map"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "executableName": "hcom_gui",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "guid": "7f3a1c8e-52d4-4b9a-9e12-6a4b8c3f21d0",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "hcom_gui",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "installerHeader": "build/installer-header.bmp",
+      "installerSidebar": "build/installer-sidebar.bmp",
+      "uninstallerSidebar": "build/installer-sidebar.bmp",
+      "include": "build/installer.nsh",
+      "artifactName": "hcom_gui-${version}-${arch}-setup.${ext}",
+      "unicode": true,
+      "language": "1042"
+    }
   }
 }
