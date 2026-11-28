@@ -1,0 +1,142 @@
+name: Windows 릴리즈
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      version_branch:
+        description: 게시할 버전 브랜치 이름 (예 V1.0.0)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: windows-release-${{ github.event.pull_request.head.ref || inputs.version_branch }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Windows x64 빌드
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.event.pull_request.head.ref, 'V')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: windows-2025
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+      - name: 버전과 릴리즈 노트 확인
+        id: version
+        shell: pwsh
+        env:
+          VERSION_BRANCH: ${{ github.event.pull_request.head.ref || inputs.version_branch }}
+        run: |
+          if ($env:VERSION_BRANCH -cmatch '^V(1\.(?:0|[1-9][0-9]*)\.0)$') {
+            $version = $Matches[1]
+          } else {
+            throw '릴리즈 브랜치는 V1.0.0, V1.1.0 형식이어야 합니다.'
+          }
+          $package = Get-Content -Raw package.json | ConvertFrom-Json
+          $lock = Get-Content -Raw package-lock.json | ConvertFrom-Json -AsHashtable
+          if ($package.version -ne $version -or $lock.version -ne $version -or $lock.packages[''].version -ne $version) {
+            throw '버전 브랜치와 package.json, package-lock.json의 버전이 일치해야 합니다.'
+          }
+          $notes = Get-Content -Raw -Encoding utf8 ".github/release-notes/$version.md"
+          if ($notes -cnotmatch '(?m)^## 추가기능\r?\n(?:\r?\n)?- .+' -or
+              $notes -cnotmatch '(?m)^## 버그픽스\r?\n(?:\r?\n)?- .+') {
+            throw '릴리즈 노트에 추가기능과 버그픽스 제목 및 점 목록을 작성해야 합니다.'
+          }
+          $commit = git rev-parse HEAD
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run typecheck
+      - name: 단위·통합 테스트
+        run: node --test --test-skip-pattern='Git 공용 디렉터리로 worktree 중복 등록' 'test/*.test.ts'
+      - run: npm run dist
+      - name: 배포 파일 준비
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installer = "hcom_gui-$env:RELEASE_VERSION-x64-setup.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "release/$installer").Hash.ToLowerInvariant()
+          "$hash  $installer" | Set-Content -Encoding utf8NoBOM release/SHA256SUMS.txt
+          Copy-Item -LiteralPath ".github/release-notes/$env:RELEASE_VERSION.md" -Destination release/notes.md
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: windows-release
+          path: |
+            release/hcom_gui-${{ steps.version.outputs.version }}-x64-setup.exe
+            release/SHA256SUMS.txt
+            release/notes.md
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+
+  publish:
+    name: GitHub 릴리즈 게시
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: windows-release
+      - name: 설치 파일과 릴리즈 노트 게시
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          tag="v$VERSION"
+          installer="hcom_gui-$VERSION-x64-setup.exe"
+          sha256sum --check --strict SHA256SUMS.txt
+
+          if existing_commit=$(gh api "repos/$GH_REPO/commits/$tag" --jq .sha 2>/dev/null); then
+            if [[ "$existing_commit" != "$COMMIT" ]]; then
+              echo "::error::이미 있는 $tag 태그가 다른 커밋을 가리킵니다."
+              exit 1
+            fi
+          fi
+
+          if gh release view "$tag" --json isDraft,targetCommitish,assets > existing.json 2>/dev/null; then
+            if [[ "$(jq -r .isDraft existing.json)" == false ]]; then
+              jq -e --arg installer "$installer" '
+                ([.assets[].name] | index($installer)) != null and
+                ([.assets[].name] | index("SHA256SUMS.txt")) != null
+              ' existing.json > /dev/null
+              exit 0
+            fi
+            if [[ "$(jq -r .targetCommitish existing.json)" != "$COMMIT" ]]; then
+              echo "::error::기존 릴리즈 초안의 대상 커밋이 일치하지 않습니다."
+              exit 1
+            fi
+            gh release edit "$tag" --notes-file notes.md
+            gh release upload "$tag" "$installer" SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" "$installer" SHA256SUMS.txt \
+              --target "$COMMIT" --title "hcom_gui $VERSION" --notes-file notes.md --draft
+          fi
+          gh release edit "$tag" --draft=false
