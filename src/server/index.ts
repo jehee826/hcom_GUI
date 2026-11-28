@@ -1,10 +1,11 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { join } from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import type { ProjectManager } from '../runtime/index.ts';
-import type { ProjectEventRecord, StoredCodexSandboxMode, WorkerPermissionMode } from '../store/index.ts';
-import { runCliDiagnostics, type CliDiagnostics } from './diagnostics.ts';
+import type { EnrichedProjectEvent, ProjectManager } from '../runtime/index.ts';
+import type { StoredCodexSandboxMode, WorkerPermissionMode } from '../store/index.ts';
+import { createDiagnosticsLoader, type CliDiagnostics } from './diagnostics.ts';
 import { createModelCatalogLoader, type ModelCatalog } from './models.ts';
 
 export interface GuiServerOptions {
@@ -14,7 +15,7 @@ export interface GuiServerOptions {
   readonly port?: number;
   readonly token?: string;
   readonly codexCommand?: string;
-  readonly getDiagnostics?: () => CliDiagnostics;
+  readonly getDiagnostics?: (refresh?: boolean) => CliDiagnostics | Promise<CliDiagnostics>;
   readonly getModels?: (refresh?: boolean) => Promise<ModelCatalog>;
 }
 
@@ -77,8 +78,16 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
   const app = express();
   const token = options.token ?? randomBytes(24).toString('hex');
   const manager = options.manager;
-  const diagnostics = options.getDiagnostics ?? (() => runCliDiagnostics(options.codexCommand));
-  const getModels = options.getModels ?? createModelCatalogLoader(options.codexCommand);
+  const diagnostics = options.getDiagnostics ?? createDiagnosticsLoader(options.codexCommand);
+  const getModels = options.getModels ?? createModelCatalogLoader(
+    options.codexCommand,
+    5 * 60_000,
+    join(manager.dataDir, 'models-cache.json'),
+  );
+  // 실제 서버 기동 시 백그라운드로 CLI 모델 카탈로그를 미리 워밍업해 첫 클릭부터 즉시 표시한다.
+  if (!options.getModels) {
+    void getModels(false).catch(() => {});
+  }
   const sseClients = new Set<Response>();
 
   app.disable('x-powered-by');
@@ -115,8 +124,13 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
     res.json({ ok: true, version: options.appVersion, dataDir: manager.dataDir });
   });
 
-  app.get('/api/diagnostics', (_req, res) => {
-    res.json(diagnostics());
+  app.get('/api/diagnostics', async (req, res) => {
+    try {
+      const refresh = queryString(req.query.refresh) === '1' || queryString(req.query.refresh) === 'true';
+      res.json(await diagnostics(refresh));
+    } catch (error) {
+      sendError(res, error);
+    }
   });
 
   app.get('/api/models', async (req, res) => {
@@ -169,18 +183,46 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
     try {
       const projectId = paramString(req.params.projectId);
       const snapshot = manager.getProjectSnapshot(projectId);
-      const requests = manager.listRequests(projectId);
-      const delegations = manager.listDelegations(projectId);
-      const events = manager.listProjectEvents(projectId, 0);
-      const progressByRequest = manager.getAllRequestProgress(projectId);
+      const rawLimit = Number.parseInt(queryString(req.query.limit) ?? '30', 10);
+      const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(200, rawLimit) : 30;
+      const page = manager.listRequestsPage(projectId, { limit });
+      const requestIds = page.requests.map(r => r.requestId);
+      const delegations = manager.listDelegationsForRequests(projectId, requestIds);
+      const progressByRequest = manager.getProgressForRequests(projectId, requestIds);
       const hcomParticipants = manager.getCachedHcomParticipants(projectId);
+      const latestSeq = manager.getLatestEventSeq(projectId);
       res.json({
         snapshot,
-        requests,
+        requests: page.requests,
         delegations,
         progressByRequest,
         hcomParticipants,
-        latestSeq: events.at(-1)?.seq ?? 0,
+        latestSeq,
+        hasMoreRequests: page.hasMore,
+        totalRequests: page.total,
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  app.get('/api/projects/:projectId/requests', (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const rawLimit = Number.parseInt(queryString(req.query.limit) ?? '30', 10);
+      const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(200, rawLimit) : 30;
+      const beforeCreatedAt = queryString(req.query.beforeCreatedAt);
+      const beforeRequestId = queryString(req.query.beforeRequestId);
+      const page = manager.listRequestsPage(projectId, { limit, beforeCreatedAt, beforeRequestId });
+      const requestIds = page.requests.map(r => r.requestId);
+      const delegations = manager.listDelegationsForRequests(projectId, requestIds);
+      const progressByRequest = manager.getProgressForRequests(projectId, requestIds);
+      res.json({
+        requests: page.requests,
+        delegations,
+        progressByRequest,
+        hasMoreRequests: page.hasMore,
+        totalRequests: page.total,
       });
     } catch (error) {
       sendError(res, error);
@@ -196,10 +238,17 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
         res.status(400).json({ error: '유효하지 않은 Codex 권한 모드입니다.' });
         return;
       }
+      const rawServiceTier = body.serviceTier === null
+        ? null
+        : typeof body.serviceTier === 'string'
+          ? (body.serviceTier.trim() === 'priority' || body.serviceTier.trim() === 'fast' ? 'priority' : null)
+          : undefined;
       const codex = manager.updateCodexSettings(projectId, {
         ...(body.model === null || typeof body.model === 'string' ? { model: body.model } : {}),
         ...(body.reasoningEffort === null || typeof body.reasoningEffort === 'string' ? { reasoningEffort: body.reasoningEffort } : {}),
+        ...(rawServiceTier !== undefined ? { serviceTier: rawServiceTier } : {}),
         ...(rawSandbox ? { sandboxMode: rawSandbox as StoredCodexSandboxMode } : {}),
+        ...(typeof body.customInstructions === 'string' ? { customInstructions: body.customInstructions } : {}),
       });
       res.json({ codex });
     } catch (error) {
@@ -291,6 +340,23 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
     }
   });
 
+  app.post('/api/projects/:projectId/workers/:workerId/input', async (req, res) => {
+    try {
+      const projectId = paramString(req.params.projectId);
+      const workerId = paramString(req.params.workerId);
+      const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+      const decision = body.decision === 'approve' || body.decision === 'deny' ? body.decision : undefined;
+      if (!decision) {
+        res.status(400).json({ error: 'decision은 approve 또는 deny여야 합니다.' });
+        return;
+      }
+      const worker = await manager.injectWorkerInput(projectId, workerId, decision);
+      res.json({ worker });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
   app.post('/api/projects/:projectId/workers/:workerId/start', async (req, res) => {
     try {
       const worker = await manager.startWorker(paramString(req.params.projectId), paramString(req.params.workerId));
@@ -320,6 +386,8 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
         res.status(400).json({ error: 'requestId와 prompt가 필요합니다.' });
         return;
       }
+      // 없는 프로젝트·워커나 다른 프로젝트 워커는 접수 전 4xx로 거절한다.
+      manager.validateWorkerTarget(projectId, workerId);
       const existing = manager.getRequest(projectId, requestId);
       if (existing) {
         res.status(200).json({ request: existing, deduplicated: true });
@@ -502,13 +570,13 @@ export async function startGuiServer(options: GuiServerOptions): Promise<GuiServ
       sseClients.add(res);
 
       let lastSent = afterSeq;
-      const writeEvent = (event: ProjectEventRecord): void => {
+      const writeEvent = (event: EnrichedProjectEvent): void => {
         if (event.projectId !== projectId || event.seq <= lastSent) return;
         lastSent = event.seq;
         res.write(`id: ${event.seq}\nevent: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`);
       };
 
-      const buffered: ProjectEventRecord[] = [];
+      const buffered: EnrichedProjectEvent[] = [];
       let replaying = true;
       const unsubscribe = manager.subscribeEvents(event => {
         if (event.projectId !== projectId) return;

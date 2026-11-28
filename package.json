@@ -10,6 +10,7 @@
     "assets": "node scripts/generate-assets.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.web.json --noEmit",
     "build": "node scripts/build.ts",
+    "dev:web": "node scripts/dev-web.ts",
     "dist": "npm run build && electron-builder --win --x64 --publish never",
     "test": "node --test test/*.test.ts",
     "verify:roundtrip": "node scripts/verify-roundtrip.ts",

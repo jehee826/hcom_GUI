@@ -2,8 +2,9 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { CodexSession, type TurnResult } from '../src/codex/index.ts';
 import { HcomAdapter, isJammedTerminal, isWorkerReply, type HcomEvent, type Participant, type Receipt, type WorkerBinding, type WorkerLaunch } from '../src/hcom/index.ts';
+import { assertExpectedBranchReply, BRANCH_CHECK_TASK } from './verify-branch-common.ts';
 
-const task = '읽기 전용 PowerShell 명령 Get-Content -LiteralPath .git/HEAD 로 파일을 읽고 ref: refs/heads/ 뒤의 브랜치 이름만 확인하세요. Git 명령은 실행하지 마세요. hcom send에서 --intent inform --reply-to <원본 요청 event_id>를 사용해 브랜치 이름만 회신하세요. ACK는 결과가 아닙니다.';
+const task = BRANCH_CHECK_TASK;
 const delay = () => new Promise(resolve => setTimeout(resolve, 1000));
 
 export async function verifyHcom(repo: string, command: string, model: string | undefined, branch: string) {
@@ -51,12 +52,18 @@ export async function verifyHcom(repo: string, command: string, model: string | 
       if (status?.data.status === 'blocked') throw new Error(`워커가 대기 상태로 중단됐습니다 (${String(status.data.context ?? 'blocked')}): ${String(status.data.detail ?? '')}`);
       const started = events.some(event => event.id > requestId && event.type === 'status' && event.instance === target.name && event.data.status === 'active');
       if (!started && tick % 2 === 1) {
-        await hcom.clearBannerOverlay(target.name).catch(() => false);
         const term = await hcom.readTerminal(target.name).catch(() => undefined);
-        if (term && isJammedTerminal(term, requestId)) {
-          jammedSince ??= Date.now();
-          if (Date.now() - jammedSince >= 4000) {
-            await hcom.clearJammedInput(target.name, requestId).catch(() => false);
+        if (term) {
+          const bannerCleared = await hcom.clearBannerOverlay(target.name, term).catch(() => false);
+          if (bannerCleared) {
+            jammedSince = undefined;
+          } else if (isJammedTerminal(term, requestId)) {
+            jammedSince ??= Date.now();
+            if (Date.now() - jammedSince >= 4000) {
+              await hcom.clearJammedInput(target.name, requestId, term).catch(() => false);
+              jammedSince = undefined;
+            }
+          } else {
             jammedSince = undefined;
           }
         } else {
@@ -92,8 +99,7 @@ export async function verifyHcom(repo: string, command: string, model: string | 
     binding = await hcom.probeWorker(worker.name);
     worker = binding;
     if (!isWorkerReply(reply, 'roundtrip', sender, binding, sent.eventId)) throw new Error('워커 바인딩과 회신이 일치하지 않습니다.');
-    const text = String(reply.data.text).trim();
-    if (text !== branch) throw new Error(`워커의 브랜치 결과 불일치: ${text}`);
+    const text = assertExpectedBranchReply(String(reply.data.text), branch, '워커의 브랜치 결과');
 
     await closeFollow();
     follow(sent.eventId);

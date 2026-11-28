@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { CodexSession } from '../codex/index.ts';
 import { defaultAgyCandidates, defaultCodexCandidates, resolveExecutable } from './diagnostics.ts';
@@ -16,12 +17,15 @@ export interface ModelOption {
 export interface ModelCatalog {
   readonly codex: ModelOption[];
   readonly agy: ModelOption[];
+  readonly codexLive?: boolean;
+  readonly agyLive?: boolean;
   readonly cachedAt: string;
 }
 
+const DEFAULT_CODEX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const DEFAULT_CODEX_FALLBACK: ModelOption[] = [
-  { id: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'medium', isDefault: true },
-  { id: 'gpt-6.1-terra', displayName: 'GPT-6.1 Terra', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultEffort: 'low', isDefault: false },
+  { id: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', efforts: DEFAULT_CODEX_EFFORTS, defaultEffort: 'medium', isDefault: true },
+  { id: 'gpt-6.1-terra', displayName: 'GPT-6.1 Terra', efforts: DEFAULT_CODEX_EFFORTS, defaultEffort: 'low', isDefault: false },
 ];
 
 const DEFAULT_AGY_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -77,7 +81,7 @@ export function parseCodexModelList(result: Record<string, unknown>): ModelOptio
     models.push({
       id,
       displayName,
-      efforts: efforts.length > 0 ? efforts : ['low', 'medium', 'high'],
+      efforts: efforts.length > 0 ? efforts : DEFAULT_CODEX_EFFORTS,
       defaultEffort,
       isDefault: obj.isDefault === true,
     });
@@ -85,54 +89,103 @@ export function parseCodexModelList(result: Record<string, unknown>): ModelOptio
   return models;
 }
 
-async function fetchCodexModels(codexCommand?: string): Promise<ModelOption[]> {
+async function fetchCodexModels(codexCommand?: string): Promise<{ models: ModelOption[]; live: boolean }> {
   const bin = resolveExecutable(codexCommand, 'codex', defaultCodexCandidates());
-  if (!bin) return DEFAULT_CODEX_FALLBACK;
+  if (!bin) return { models: DEFAULT_CODEX_FALLBACK, live: false };
   let session: CodexSession | undefined;
   try {
     session = await CodexSession.connect({
       command: bin,
       cwd: process.cwd(),
       env: process.env,
-      timeoutMs: 8000,
+      timeoutMs: 20_000,
     });
     const result = await session.listModels();
     const parsed = parseCodexModelList(result);
-    return parsed.length > 0 ? parsed : DEFAULT_CODEX_FALLBACK;
+    return parsed.length > 0
+      ? { models: parsed, live: true }
+      : { models: DEFAULT_CODEX_FALLBACK, live: false };
   } catch {
-    return DEFAULT_CODEX_FALLBACK;
+    return { models: DEFAULT_CODEX_FALLBACK, live: false };
   } finally {
     await session?.close().catch(() => {});
   }
 }
 
-async function fetchAgyModels(): Promise<ModelOption[]> {
+async function fetchAgyModels(): Promise<{ models: ModelOption[]; live: boolean }> {
   const bin = resolveExecutable(undefined, 'agy', defaultAgyCandidates());
-  if (!bin) return DEFAULT_AGY_FALLBACK;
+  if (!bin) return { models: DEFAULT_AGY_FALLBACK, live: false };
   try {
     const { stdout } = await execFileAsync(bin, ['models'], {
       encoding: 'utf8',
-      timeout: 10_000,
+      timeout: 25_000,
       windowsHide: true,
     });
     const parsed = parseAgyModelsOutput(stdout);
-    return parsed.length > 0 ? parsed : DEFAULT_AGY_FALLBACK;
+    return parsed.length > 0
+      ? { models: parsed, live: true }
+      : { models: DEFAULT_AGY_FALLBACK, live: false };
   } catch {
-    return DEFAULT_AGY_FALLBACK;
+    return { models: DEFAULT_AGY_FALLBACK, live: false };
   }
 }
 
-export function createModelCatalogLoader(codexCommand?: string, ttlMs = 5 * 60_000) {
+function readDiskCache(cacheFilePath?: string): ModelCatalog | undefined {
+  if (!cacheFilePath || !existsSync(cacheFilePath)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(cacheFilePath, 'utf8')) as Partial<ModelCatalog>;
+    if (Array.isArray(parsed.codex) && parsed.codex.length > 0 && Array.isArray(parsed.agy) && parsed.agy.length > 0) {
+      return {
+        codex: parsed.codex,
+        agy: parsed.agy,
+        codexLive: Boolean(parsed.codexLive),
+        agyLive: Boolean(parsed.agyLive),
+        cachedAt: typeof parsed.cachedAt === 'string' ? parsed.cachedAt : new Date().toISOString(),
+      };
+    }
+  } catch {}
+  return undefined;
+}
+
+function writeDiskCache(cacheFilePath: string | undefined, catalog: ModelCatalog): void {
+  if (!cacheFilePath) return;
+  try {
+    writeFileSync(cacheFilePath, JSON.stringify(catalog), 'utf8');
+  } catch {}
+}
+
+export function createModelCatalogLoader(codexCommand?: string, ttlMs = 5 * 60_000, cacheFilePath?: string) {
   let cache: { catalog: ModelCatalog; expiresAt: number } | undefined;
+  const diskSeed = readDiskCache(cacheFilePath);
+  if (diskSeed && diskSeed.codexLive && diskSeed.agyLive) {
+    // 디스크 캐시는 CLI 조회 실패 시 안전망으로 보관하되, 앱 시작 시 항상 최신 CLI 모델 목록을 백그라운드로 재조회한다.
+    cache = { catalog: diskSeed, expiresAt: 0 };
+  }
   let inflight: Promise<ModelCatalog> | undefined;
 
   return async (refresh = false): Promise<ModelCatalog> => {
     if (!refresh && cache && Date.now() < cache.expiresAt) return cache.catalog;
     if (!inflight) {
       inflight = Promise.all([fetchCodexModels(codexCommand), fetchAgyModels()])
-        .then(([codex, agy]) => {
-          const catalog: ModelCatalog = { codex, agy, cachedAt: new Date().toISOString() };
-          cache = { catalog, expiresAt: Date.now() + ttlMs };
+        .then(([codexRes, agyRes]) => {
+          const prev = cache?.catalog ?? diskSeed;
+          const codex = codexRes.live ? codexRes.models : (prev?.codexLive ? prev.codex : codexRes.models);
+          const agy = agyRes.live ? agyRes.models : (prev?.agyLive ? prev.agy : agyRes.models);
+          const codexLive = codexRes.live || Boolean(prev?.codexLive);
+          const agyLive = agyRes.live || Boolean(prev?.agyLive);
+          const catalog: ModelCatalog = {
+            codex,
+            agy,
+            codexLive,
+            agyLive,
+            cachedAt: new Date().toISOString(),
+          };
+          // 실패한 폴백은 5분 캐시하지 않고 5초 뒤 재시도한다.
+          const nextTtl = codexLive && agyLive ? ttlMs : 5_000;
+          cache = { catalog, expiresAt: Date.now() + nextTtl };
+          if (codexRes.live || agyRes.live) {
+            writeDiskCache(cacheFilePath, catalog);
+          }
           return catalog;
         })
         .finally(() => { inflight = undefined; });
