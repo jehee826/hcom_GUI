@@ -301,10 +301,10 @@ test('권한 설정·모델 설정·승인 대기 복구(waiting_approval)·실�
     assert.match(done.finalText ?? '', /gpt-6\.1-terra\/high/);
     assert.ok(injected.some(i => i.name === 'varo' && i.text === '\r'));
 
-    // 4. list_workers에 tool: 'agy' 포함 & 추론/워커 로그 수집 확인
-    const parsedWorkers = JSON.parse(listWorkersJson) as Array<{ tool: string; engine: string }>;
+    // 4. list_workers에 tool: 'agy' 포함(경량 JSON) & 추론/워커 로그 수집 확인
+    const parsedWorkers = JSON.parse(listWorkersJson) as Array<{ tool: string; permissionMode?: string }>;
     assert.equal(parsedWorkers[0]!.tool, 'agy');
-    assert.match(parsedWorkers[0]!.engine, /Antigravity/);
+    assert.equal(parsedWorkers[0]!.permissionMode, 'ask');
 
     const progress = manager.getRequestProgress(pid, 'req-approval-1');
     assert.ok(progress.some(p => p.source === 'codex' && p.kind === 'reasoning'));

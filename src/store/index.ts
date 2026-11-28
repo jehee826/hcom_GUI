@@ -46,6 +46,7 @@ export interface ProgressLogEntry {
   readonly kind: string;
   readonly summary: string;
   readonly detail?: string;
+  readonly eventId?: number;
 }
 
 export interface ProjectRecord {
@@ -66,7 +67,9 @@ export interface CodexSessionRecord {
   readonly hcomName: string | null;
   readonly model: string | null;
   readonly reasoningEffort: string | null;
+  readonly serviceTier: string | null;
   readonly sandboxMode: StoredCodexSandboxMode;
+  readonly customInstructions: string;
   readonly status: CodexSessionStatus;
   readonly lastError: string | null;
   readonly updatedAt: string;
@@ -202,7 +205,9 @@ function mapCodex(row: Row): CodexSessionRecord {
     hcomName: asNullableString(row.hcom_name),
     model: asNullableString(row.model),
     reasoningEffort: asNullableString(row.reasoning_effort),
+    serviceTier: asNullableString(row.service_tier),
     sandboxMode,
+    customInstructions: asString(row.custom_instructions),
     status: asString(row.status) as CodexSessionStatus,
     lastError: asNullableString(row.last_error),
     updatedAt: asString(row.updated_at),
@@ -524,7 +529,9 @@ export class ProjectStore {
     // 기존 DB 업그레이드 호환을 위한 컬럼 마이그레이션
     this.ensureColumn('codex_sessions', 'model', 'TEXT');
     this.ensureColumn('codex_sessions', 'reasoning_effort', 'TEXT');
+    this.ensureColumn('codex_sessions', 'service_tier', 'TEXT');
     this.ensureColumn('codex_sessions', 'sandbox_mode', "TEXT NOT NULL DEFAULT 'danger-full-access'");
+    this.ensureColumn('codex_sessions', 'custom_instructions', "TEXT NOT NULL DEFAULT ''");
 
     this.ensureColumn('workers', 'model', 'TEXT');
     this.ensureColumn('workers', 'reasoning_effort', 'TEXT');
@@ -664,7 +671,9 @@ export class ProjectStore {
       hcomName: string | null;
       model: string | null;
       reasoningEffort: string | null;
+      serviceTier: string | null;
       sandboxMode: StoredCodexSandboxMode;
+      customInstructions: string;
       status: CodexSessionStatus;
       lastError: string | null;
     }>,
@@ -686,16 +695,18 @@ export class ProjectStore {
         hcomName: patch.hcomName !== undefined ? patch.hcomName : current.hcomName,
         model: patch.model !== undefined ? patch.model : current.model,
         reasoningEffort: patch.reasoningEffort !== undefined ? patch.reasoningEffort : current.reasoningEffort,
+        serviceTier: patch.serviceTier !== undefined ? patch.serviceTier : current.serviceTier,
         sandboxMode: patch.sandboxMode !== undefined ? patch.sandboxMode : current.sandboxMode,
+        customInstructions: patch.customInstructions !== undefined ? patch.customInstructions : current.customInstructions,
         status: patch.status !== undefined ? patch.status : current.status,
         lastError: patch.lastError !== undefined ? patch.lastError : current.lastError,
         updatedAt: nowIso(),
       };
       this.db.prepare(`
         UPDATE codex_sessions
-        SET cwd = ?, thread_id = ?, hcom_name = ?, model = ?, reasoning_effort = ?, sandbox_mode = ?, status = ?, last_error = ?, updated_at = ?
+        SET cwd = ?, thread_id = ?, hcom_name = ?, model = ?, reasoning_effort = ?, service_tier = ?, sandbox_mode = ?, custom_instructions = ?, status = ?, last_error = ?, updated_at = ?
         WHERE project_id = ?
-      `).run(next.cwd, next.threadId, next.hcomName, next.model, next.reasoningEffort, next.sandboxMode, next.status, next.lastError, next.updatedAt, projectId);
+      `).run(next.cwd, next.threadId, next.hcomName, next.model, next.reasoningEffort, next.serviceTier, next.sandboxMode, next.customInstructions, next.status, next.lastError, next.updatedAt, projectId);
       return next;
     });
   }
@@ -864,6 +875,60 @@ export class ProjectStore {
   listRequests(projectId: string): RequestRecord[] {
     const rows = this.db.prepare('SELECT * FROM requests WHERE project_id = ? ORDER BY created_at ASC, request_id ASC').all(projectId) as Row[];
     return rows.map(mapRequest);
+  }
+
+  listRequestsPage(
+    projectId: string,
+    options: { limit?: number; beforeCreatedAt?: string; beforeRequestId?: string } = {},
+  ): { requests: RequestRecord[]; hasMore: boolean; total: number } {
+    const totalRow = this.db.prepare('SELECT COUNT(*) AS cnt FROM requests WHERE project_id = ?').get(projectId) as Row | undefined;
+    const total = totalRow ? asNumber(totalRow.cnt) : 0;
+    const rawLimit = options.limit ?? 30;
+    const limit = Math.max(1, Math.min(200, Math.floor(rawLimit)));
+
+    let rows: Row[];
+    if (options.beforeCreatedAt) {
+      const beforeReqId = options.beforeRequestId ?? '';
+      rows = this.db.prepare(`
+        SELECT * FROM requests
+        WHERE project_id = ?
+          AND (created_at < ? OR (created_at = ? AND request_id < ?))
+        ORDER BY created_at DESC, request_id DESC
+        LIMIT ?
+      `).all(projectId, options.beforeCreatedAt, options.beforeCreatedAt, beforeReqId, limit + 1) as Row[];
+    } else {
+      rows = this.db.prepare(`
+        SELECT * FROM requests
+        WHERE project_id = ?
+        ORDER BY created_at DESC, request_id DESC
+        LIMIT ?
+      `).all(projectId, limit + 1) as Row[];
+    }
+
+    const hasMore = rows.length > limit;
+    const slice = hasMore ? rows.slice(0, limit) : rows;
+    slice.reverse();
+    return {
+      requests: slice.map(mapRequest),
+      hasMore,
+      total,
+    };
+  }
+
+  listDelegationsForRequests(projectId: string, requestIds: readonly string[]): DelegationRecord[] {
+    if (requestIds.length === 0) return [];
+    const placeholders = requestIds.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT * FROM delegations
+      WHERE project_id = ? AND request_id IN (${placeholders})
+      ORDER BY created_at ASC
+    `).all(projectId, ...requestIds) as Row[];
+    return rows.map(mapDelegation);
+  }
+
+  getLatestEventSeq(projectId: string): number {
+    const row = this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS max_seq FROM project_events WHERE project_id = ?').get(projectId) as Row | undefined;
+    return row ? asNumber(row.max_seq) : 0;
   }
 
   updateRequest(

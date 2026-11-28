@@ -11,7 +11,7 @@ export interface WorkerLaunch { readonly name: string; readonly batchId: string;
 export type WorkerLaunchOptions = string | { settingsPath?: string; cwd?: string; model?: string; effort?: string };
 export interface WorkerBinding extends Participant { evidence: 'hcom-managed-binding'; hooksBound: true; processBound: true; directory: string }
 export interface Receipt { eventId: number; deliveredTo: string[] }
-export interface HcomEvent { projectId: string; id: number; type: string; instance?: string; data: Record<string, unknown> }
+export interface HcomEvent { projectId: string; id: number; type: string; instance?: string; ts?: string; data: Record<string, unknown> }
 export interface TerminalState { ready: boolean; promptEmpty: boolean | null; inputText: string | null; lines: string[]; cursorRow?: number }
 export interface CommandResult { stdout: string; stderr: string; code: number }
 export type Runner = (args: string[], env: NodeJS.ProcessEnv, cwd: string) => Promise<CommandResult>;
@@ -63,6 +63,7 @@ export function parseFollowLine(line: string, projectId: string): HcomEvent {
     id: value.id as number,
     type: value.type,
     instance: typeof value.instance === 'string' ? value.instance : undefined,
+    ts: typeof value.ts === 'string' ? value.ts : undefined,
     data: value.data as Record<string, unknown>,
   };
 }
@@ -307,9 +308,24 @@ export class HcomAdapter {
       return result.stdout.trim() ? [{ text: result.stdout.trim() }] : [];
     }
   }
+  async listEvents(last = 120): Promise<HcomEvent[]> {
+    this.requireReady();
+    const count = Math.max(1, Math.min(500, Math.floor(last)));
+    const result = await this.runner(['events', '--last', String(count), '--full'], { ...this.env }, this.scope.cwd);
+    if (result.code !== 0) return [];
+    const out: HcomEvent[] = [];
+    for (const rawLine of result.stdout.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      try {
+        out.push(parseFollowLine(line, this.scope.projectId));
+      } catch {}
+    }
+    return out;
+  }
   // agy 1.5.18 시작 공지 배너가 프롬프트를 밀어낼 때 구분선·단축키 안내가 입력칸에 겹친다.
-  async clearBannerOverlay(name: string): Promise<boolean> {
-    let term = await this.readTerminal(name);
+  async clearBannerOverlay(name: string, initialTerm?: TerminalState): Promise<boolean> {
+    let term = initialTerm ?? await this.readTerminal(name);
     const hasBanner = term.lines.some(line => line.includes('esc to dismiss'));
     const input = term.inputText?.trim() ?? '';
     const artifact = /^(?:for shortcuts|─+)$/;
@@ -347,8 +363,8 @@ export class HcomAdapter {
     }
     return false;
   }
-  async clearJammedInput(name: string, requestId: number): Promise<boolean> {
-    const term = await this.readTerminal(name);
+  async clearJammedInput(name: string, requestId: number, initialTerm?: TerminalState): Promise<boolean> {
+    const term = initialTerm ?? await this.readTerminal(name);
     if (!isJammedTerminal(term, requestId)) return false;
     // 입력칸에서 직접 확인한 요청만 지우고, 화면 잔상은 다시 그리기만 한다.
     const inputMatches = term.promptEmpty !== true && term.inputText?.trim().startsWith(`<hcom>[request #${requestId}]`);
@@ -378,7 +394,7 @@ export class HcomAdapter {
       }
       const hasBanner = term.lines.some(line => line.includes('esc to dismiss'));
       if (term.lines.some(line => /\(Google AI|\bPro\b|\bUltra\b/.test(line))) sawTier = true;
-      if (await this.clearBannerOverlay(name)) {
+      if (await this.clearBannerOverlay(name, term)) {
         stableClean = 0;
         await new Promise(resolve => setTimeout(resolve, 400));
         continue;

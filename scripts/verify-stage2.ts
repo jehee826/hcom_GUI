@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { ProjectManager } from '../src/runtime/index.ts';
+import { assertExpectedBranchReply, BRANCH_CHECK_TASK, buildWorkerBranchDelegationPrompt } from './verify-branch-common.ts';
 
 function arg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -23,7 +24,7 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }).trim();
 }
 
-const branchTask = '읽기 전용 PowerShell 명령 Get-Content -LiteralPath .git/HEAD 로 파일을 읽고 ref: refs/heads/ 뒤의 브랜치 이름만 확인하세요. Git 명령은 실행하지 마세요. hcom send에서 --intent inform --reply-to <원본 요청 event_id>를 사용해 브랜치 이름만 회신하세요. ACK는 결과가 아닙니다.';
+const branchTask = BRANCH_CHECK_TASK;
 
 async function main(): Promise<void> {
   const baseDir = arg('--base');
@@ -112,10 +113,10 @@ async function main(): Promise<void> {
 
     // 5. A 기본 워커 바인딩 확보 + A 추가 워커와 B 기본 워커에 동시 Codex 위임 왕복
     const a1Check = await activeManager.sendTaskToWorker(regA.project.projectId, workerA1.workerId, branchTask);
-    assert.equal(String(a1Check.reply.data.text).trim(), 'stage2-a');
+    assertExpectedBranchReply(String(a1Check.reply.data.text), 'stage2-a', 'A 기본 워커 브랜치');
 
-    const promptA = `먼저 list_workers 도구를 호출해 현재 프로젝트 워커를 확인한 뒤, workerId가 "${workerA2First.workerId}" 인 워커에게만 delegate_work 도구로 다음 지시를 위임하세요: "${branchTask}". 위임 후에는 전달 사실만 짧게 답하고, 이후 도구 출력으로 워커 회신이 전달되면 다른 설명이나 서식 없이 브랜치 이름만 그대로 답하세요.`;
-    const promptB = `먼저 list_workers 도구를 호출해 현재 프로젝트 워커를 확인한 뒤, workerId가 "${workerB1.workerId}" 인 워커에게만 delegate_work 도구로 다음 지시를 위임하세요: "${branchTask}". 위임 후에는 전달 사실만 짧게 답하고, 이후 도구 출력으로 워커 회신이 전달되면 다른 설명이나 서식 없이 브랜치 이름만 그대로 답하세요.`;
+    const promptA = buildWorkerBranchDelegationPrompt(workerA2First.workerId);
+    const promptB = buildWorkerBranchDelegationPrompt(workerB1.workerId);
 
     const [reqA, reqB] = await Promise.all([
       activeManager.submitRequest(regA.project.projectId, 'stage2-req-a', promptA),
@@ -123,8 +124,8 @@ async function main(): Promise<void> {
     ]);
     assert.equal(reqA.status, 'completed', `A 요청 실패: ${JSON.stringify(reqA)}`);
     assert.equal(reqB.status, 'completed', `B 요청 실패: ${JSON.stringify(reqB)}`);
-    assert.equal(reqA.finalText?.trim(), 'stage2-a');
-    assert.equal(reqB.finalText?.trim(), 'stage2-b');
+    assertExpectedBranchReply(reqA.finalText, 'stage2-a', 'A 위임 최종 결과');
+    assertExpectedBranchReply(reqB.finalText, 'stage2-b', 'B 위임 최종 결과');
 
     const afterDelegationA = activeManager.getProjectSnapshot(regA.project.projectId);
     const afterDelegationB = activeManager.getProjectSnapshot(regB.project.projectId);

@@ -8,208 +8,245 @@
 </head>
 <body>
   <div class="app-shell" id="appShell">
-    <header class="topbar">
-      <div class="topbar-left">
-        <button id="toggleLeftBtn" class="icon-btn" title="프로젝트 사이드바 접기/열기" aria-label="프로젝트 사이드바 토글">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" stroke-width="1.3"/>
-            <line x1="5.5" y1="2.5" x2="5.5" y2="13.5" stroke="currentColor" stroke-width="1.3"/>
-          </svg>
-        </button>
-        <div class="brand">
-          <svg class="brand-mark" width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <!-- Zone 1: Far-left Icon Rail -->
+    <nav class="icon-rail" aria-label="주 메뉴">
+      <div class="rail-top">
+        <button id="railHomeBtn" class="rail-brand-btn" type="button" title="hcom_gui · 프로젝트 사이드바 토글" aria-label="hcom_gui">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <rect x="2" y="2" width="20" height="20" rx="6" fill="#111111"/>
             <circle cx="8.5" cy="9" r="2.2" fill="#FFFFFF"/>
             <circle cx="15.5" cy="9" r="2.2" fill="#FFFFFF"/>
             <circle cx="12" cy="15.5" r="2.2" fill="#FFFFFF"/>
             <path d="M10.5 9H13.5M9.5 11L11.1 13.7M14.5 11L12.9 13.7" stroke="#FFFFFF" stroke-width="1.4" stroke-linecap="round"/>
           </svg>
-          <span class="brand-name">hcom_gui</span>
-        </div>
-      </div>
-
-      <div class="topbar-center">
-        <span id="headerProjectName" class="header-project">프로젝트를 선택하세요</span>
-        <span id="headerBranchBadge" class="pill pill-subtle hidden"></span>
-        <span id="headerIsolationBadge" class="pill pill-outline hidden">격리 HCOM</span>
-      </div>
-
-      <div class="topbar-right">
-        <button id="diagnosticsBtn" class="pill pill-clickable" title="CLI 환경 상태 점검">
-          <span id="diagDot" class="status-dot dot-stopped"></span>
-          <span id="diagSummary">CLI 확인 중</span>
         </button>
-        <button id="updateBtn" class="btn btn-subtle btn-sm" title="최신 설치 파일(.exe)로 업데이트">
-          <span id="versionLabel">v1.0.0</span> · 업데이트
-        </button>
-        <button id="toggleRightBtn" class="icon-btn" title="워커·인계 패널 접기/열기" aria-label="워커 패널 토글">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" stroke-width="1.3"/>
-            <line x1="10.5" y1="2.5" x2="10.5" y2="13.5" stroke="currentColor" stroke-width="1.3"/>
+
+        <button id="toggleLeftBtn" class="rail-btn is-active" type="button" title="프로젝트 목록 접기/열기" aria-label="프로젝트 사이드바 토글">
+          <svg width="17" height="17" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" stroke-width="1.5"/>
+            <line x1="7.5" y1="3.5" x2="7.5" y2="16.5" stroke="currentColor" stroke-width="1.5"/>
           </svg>
         </button>
+
+        <button id="railRegisterBtn" class="rail-btn" type="button" title="새 프로젝트 폴더 등록" aria-label="새 프로젝트 폴더 등록">
+          <svg width="17" height="17" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="M2.5 6.5C2.5 5.4 3.4 4.5 4.5 4.5H8L9.6 6.2H15.5C16.6 6.2 17.5 7.1 17.5 8.2V14.5C17.5 15.6 16.6 16.5 15.5 16.5H4.5C3.4 16.5 2.5 15.6 2.5 14.5V6.5Z" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M10 9.2V13.8M7.7 11.5H12.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+
+        <button id="railRightBtn" class="rail-btn is-active" type="button" title="우측 워커 패널 접기/열기" aria-label="우측 워커 패널 토글">
+          <svg width="17" height="17" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" stroke-width="1.5"/>
+            <line x1="12.5" y1="3.5" x2="12.5" y2="16.5" stroke="currentColor" stroke-width="1.5"/>
+          </svg>
+        </button>
+
+        <button id="instructionsModalBtn" class="rail-btn" type="button" title="프로젝트 사용자 지침 (선택)" aria-label="사용자 지침" disabled>
+          <svg width="17" height="17" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="M4.5 5.5H15.5M4.5 10H12.5M4.5 14.5H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span id="instructionsDot" class="rail-dot dot-ready hidden"></span>
+        </button>
+
+        <button id="diagnosticsBtn" class="rail-btn" type="button" title="로컬 CLI 연결 상태" aria-label="CLI 연결 상태">
+          <svg width="17" height="17" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="M4 6.5L7.5 10L4 13.5M10 13.5H16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span id="diagDot" class="rail-dot dot-stopped"></span>
+        </button>
       </div>
-    </header>
 
-    <div class="workspace">
-      <aside id="leftSidebar" class="sidebar sidebar-left">
-        <div class="sidebar-header">
-          <span class="section-title">프로젝트</span>
-          <button id="openRegisterBtn" class="btn btn-primary btn-xs">+ 등록</button>
-        </div>
-        <div id="projectList" class="project-list"></div>
-        <div class="sidebar-footer">
-          <div class="cli-mini" id="cliMiniList"></div>
-        </div>
-      </aside>
+      <div class="rail-bottom">
+        <button id="updateBtn" class="rail-btn" type="button" title="버전 정보 및 설치 파일 업데이트" aria-label="업데이트">
+          <svg width="17" height="17" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M10 6.8V10.4M10 13.2V13.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <span id="versionLabel" class="rail-version">1.0</span>
+      </div>
+    </nav>
 
+    <!-- Zone 2: Left Project Sidebar -->
+    <aside id="leftSidebar" class="sidebar sidebar-left">
+      <div class="sidebar-top">
+        <div class="sidebar-brand-row">
+          <span class="sidebar-brand-title">hcom_gui</span>
+          <div class="sidebar-brand-tools">
+            <button id="toggleSearchBtn" class="icon-btn-sm" type="button" title="프로젝트 검색" aria-label="프로젝트 검색">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="7.2" cy="7.2" r="4.8" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M11 11L14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <button id="openRegisterBtn" class="icon-btn-sm" type="button" title="프로젝트 등록" aria-label="프로젝트 등록">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 3.2V12.8M3.2 8H12.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div id="projectSearchWrap" class="sidebar-search hidden">
+          <input id="projectSearchInput" class="search-input" type="text" placeholder="프로젝트 이름·경로 검색..." />
+        </div>
+
+        <button id="quickRegisterRowBtn" class="sidebar-action-row" type="button">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 3.5V12.5M3.5 8H12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span>새 프로젝트 등록</span>
+        </button>
+      </div>
+
+      <div id="projectList" class="project-list"></div>
+
+      <div class="sidebar-footer">
+        <div class="cli-mini" id="cliMiniList">
+          <span class="muted-text" style="font-size: 11px;">CLI 확인 중...</span>
+        </div>
+      </div>
+    </aside>
+    <div id="leftResizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="왼쪽 사이드바 너비 조절" title="드래그하여 너비 조절 (더블클릭 초기화)"></div>
+
+    <!-- Zone 3 + Zone 4 Wrapper -->
+    <div class="stage-wrap">
+      <!-- Zone 3: Main Conversation Stage -->
       <main class="main-stage">
-        <div id="projectBar" class="project-bar hidden">
-          <div class="project-bar-top">
-            <div class="project-bar-info">
-              <div id="projectPathText" class="mono-text muted-text truncate"></div>
-              <div class="project-bar-meta">
-                <span id="codexStatusChip" class="chip">Codex 중지</span>
-                <span id="threadIdChip" class="chip mono-text hidden"></span>
-                <span id="hcomDirChip" class="chip mono-text hidden"></span>
-              </div>
-            </div>
-            <div class="project-bar-actions">
-              <button id="startProjectBtn" class="btn btn-primary btn-sm">시작 / 재개</button>
-              <button id="stopProjectBtn" class="btn btn-outline btn-sm">중지</button>
-            </div>
+        <header class="stage-header">
+          <div class="stage-header-left">
+            <svg class="stage-folder-icon" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M2 4.8C2 3.9 2.7 3.2 3.6 3.2H6.4L7.7 4.6H12.4C13.3 4.6 14 5.3 14 6.2V11.4C14 12.3 13.3 13 12.4 13H3.6C2.7 13 2 12.3 2 11.4V4.8Z" stroke="currentColor" stroke-width="1.35"/>
+            </svg>
+            <span id="headerProjectName" class="header-project">프로젝트를 선택하세요</span>
           </div>
-          <div class="project-controls-bar">
-            <label class="inline-control" title="이 프로젝트의 Codex 오케스트레이터 모델">
-              <span class="inline-control-label">Codex 모델</span>
-              <select id="codexModelSelect" class="select-compact"></select>
-            </label>
-            <label class="inline-control" title="Codex 추론 강도(속도·깊이)">
-              <span class="inline-control-label">추론</span>
-              <select id="codexEffortSelect" class="select-compact"></select>
-            </label>
-            <label class="inline-control" title="Codex 파일·명령 권한 범위">
-              <span class="inline-control-label">권한</span>
-              <select id="codexSandboxSelect" class="select-compact">
-                <option value="workspace-write">작업폴더 쓰기</option>
-                <option value="read-only">읽기 전용</option>
-                <option value="danger-full-access">전체 허용</option>
-              </select>
-            </label>
-            <button id="refreshModelsBtn" class="btn btn-subtle btn-xs" type="button" title="Codex · agy CLI 모델 목록 새로고침">모델 새로고침</button>
+
+          <div class="stage-header-right">
+            <button id="toggleRightBtn" class="icon-btn-sm" type="button" title="우측 워커 패널 접기/열기" aria-label="우측 워커 패널 토글">
+              <svg width="16" height="16" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" stroke-width="1.45"/>
+                <line x1="12.5" y1="3.5" x2="12.5" y2="16.5" stroke="currentColor" stroke-width="1.45"/>
+              </svg>
+            </button>
           </div>
-        </div>
+        </header>
 
         <div id="bannerNotice" class="banner-notice hidden"></div>
 
-        <section id="conversationScroll" class="conversation-scroll">
-          <div id="emptyState" class="empty-state">
-            <div class="empty-card">
-              <div class="empty-icon">
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <rect x="2" y="2" width="20" height="20" rx="6" fill="#111111"/>
-                  <circle cx="8.5" cy="9" r="2.2" fill="#FFFFFF"/>
-                  <circle cx="15.5" cy="9" r="2.2" fill="#FFFFFF"/>
-                  <circle cx="12" cy="15.5" r="2.2" fill="#FFFFFF"/>
-                  <path d="M10.5 9H13.5M9.5 11L11.1 13.7M14.5 11L12.9 13.7" stroke="#FFFFFF" stroke-width="1.4" stroke-linecap="round"/>
-                </svg>
+        <section class="conversation-area">
+          <div id="turnMinimap" class="turn-minimap hidden" aria-hidden="true"></div>
+          <div id="conversationScroll" class="conversation-scroll">
+            <div id="emptyState" class="empty-state">
+              <div class="empty-card">
+                <div class="empty-icon">
+                  <svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <rect x="2" y="2" width="20" height="20" rx="6" fill="#111111"/>
+                    <circle cx="8.5" cy="9" r="2.2" fill="#FFFFFF"/>
+                    <circle cx="15.5" cy="9" r="2.2" fill="#FFFFFF"/>
+                    <circle cx="12" cy="15.5" r="2.2" fill="#FFFFFF"/>
+                    <path d="M10.5 9H13.5M9.5 11L11.1 13.7M14.5 11L12.9 13.7" stroke="#FFFFFF" stroke-width="1.4" stroke-linecap="round"/>
+                  </svg>
+                </div>
+                <h1>프로젝트별 격리 AI 워크스페이스</h1>
+                <p>로컬 폴더를 등록하면 프로젝트마다 독립된 Codex 스레드와 Antigravity 워커가 분리되어 실행됩니다.</p>
+                <button id="emptyRegisterBtn" class="btn btn-primary" type="button">로컬 프로젝트 폴더 등록</button>
               </div>
-              <h1>프로젝트별 격리 AI 세션 워크스페이스</h1>
-              <p>로컬 폴더(Git 저장소 또는 일반 폴더)를 등록하면 프로젝트마다 독립된 <code>HCOM_DIR</code>, Codex 스레드, Antigravity 워커 세션이 분리되어 실행됩니다.</p>
-              <button id="emptyRegisterBtn" class="btn btn-primary">로컬 프로젝트 폴더 등록</button>
+            </div>
+
+            <div id="feedContainer" class="feed-container hidden">
+              <div id="loadOlderWrap" class="load-older-wrap hidden">
+                <button id="loadOlderBtn" class="btn btn-subtle btn-xs" type="button">이전 대화 더 불러오기</button>
+              </div>
+              <div id="messageFeed" class="message-feed"></div>
             </div>
           </div>
-          <div id="messageFeed" class="message-feed hidden"></div>
         </section>
 
-        <section id="hcomStrip" class="hcom-strip hidden">
-          <button id="toggleHcomLogBtn" class="hcom-strip-toggle">
-            <span>hcom 세션 메시지</span>
-            <span id="hcomLogCount" class="pill pill-subtle">0</span>
-          </button>
-          <div id="hcomLogList" class="hcom-log-list hidden"></div>
-        </section>
-
+        <!-- Floating Codex-style Composer with Custom Pill Popovers -->
         <footer class="composer-wrap">
           <div class="composer-card">
             <textarea
               id="promptInput"
               class="composer-input"
               rows="2"
-              placeholder="선택한 프로젝트의 Codex에게 지시하세요 (Enter 전송 · Shift+Enter 줄바꿈)"
+              placeholder="Codex와 함께 작업하세요"
               disabled
             ></textarea>
-            <div class="composer-footer">
-              <span id="composerHint" class="composer-hint">프로젝트를 먼저 선택하세요</span>
-              <div class="composer-actions">
-                <select id="composerTargetSelect" class="target-select" title="메시지 전송 대상" disabled>
-                  <option value="codex">Codex (오케스트레이터)</option>
-                </select>
-                <span id="targetProjectTag" class="target-tag hidden"></span>
-                <button id="sendBtn" class="btn btn-primary btn-sm" disabled>전송</button>
+            <div class="composer-toolbar">
+              <div class="composer-toolbar-left">
+                <button id="targetPickerBtn" class="picker-trigger" type="button" title="전송 대상 선택" disabled>
+                  <span class="composer-plus" aria-hidden="true">+</span>
+                  <span id="targetPickerLabel">Codex</span>
+                </button>
+
+                <button id="codexPermPickerBtn" class="picker-trigger" type="button" title="Codex 권한 범위" disabled>
+                  <span id="codexPermPickerLabel">작업폴더 쓰기</span>
+                  <span class="picker-caret" aria-hidden="true">▾</span>
+                </button>
+              </div>
+
+              <div class="composer-toolbar-right">
+                <button id="codexModelEffortBtn" class="picker-trigger picker-trigger-model" type="button" title="Codex 모델 및 추론 강도" disabled>
+                  <svg id="codexFastIcon" class="composer-fast-icon hidden" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <path d="M11.2 2.5L4.8 11H10L8.8 17.5L15.2 9H10L11.2 2.5Z" fill="currentColor" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+                  </svg>
+                  <span id="codexModelLabel" class="picker-model-name">기본 모델</span>
+                  <span id="codexEffortLabel" class="picker-effort-name">Default</span>
+                </button>
+
+                <button id="sendBtn" class="send-circle-btn" type="button" title="전송 (Enter)" aria-label="전송" disabled>
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M8 12.5V3.8M4.3 7.3L8 3.6L11.7 7.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
               </div>
             </div>
           </div>
         </footer>
       </main>
 
-      <aside id="rightSidebar" class="sidebar sidebar-right">
-        <div class="panel-section">
-          <div class="sidebar-header">
-            <span class="section-title">워커 (hcom)</span>
-            <button id="openAddWorkerBtn" class="btn btn-outline btn-xs" disabled>+ 워커 추가</button>
+      <!-- Zone 4: Streamlined Right Floating Worker Card -->
+      <div id="rightResizer" class="sidebar-resizer sidebar-resizer-right" role="separator" aria-orientation="vertical" aria-label="워커 사이드바 너비 조절" title="드래그하여 너비 조절 (더블클릭 초기화)"></div>
+      <aside id="rightSidebar" class="inspector-card">
+        <section class="inspector-section inspector-workers-section">
+          <div class="inspector-section-head">
+            <span class="inspector-title">워커</span>
+            <button id="openAddWorkerBtn" class="icon-btn-sm" type="button" title="Antigravity 워커 추가" aria-label="워커 추가" disabled>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 3.2V12.8M3.2 8H12.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </button>
           </div>
           <div id="workerList" class="worker-list"></div>
-        </div>
+        </section>
 
-        <div class="panel-section panel-handoff">
-          <div class="sidebar-header">
-            <span class="section-title">인계 기록</span>
-            <button id="saveHandoffBtn" class="btn btn-outline btn-xs" disabled>저장</button>
-          </div>
-          <div id="handoffForm" class="handoff-form">
-            <div class="handoff-meta-grid">
-              <div class="meta-box">
-                <span class="meta-label">브랜치</span>
-                <span id="handoffBranch" class="meta-value mono-text">-</span>
-              </div>
-              <div class="meta-box">
-                <span class="meta-label">커밋</span>
-                <span id="handoffCommit" class="meta-value mono-text truncate">-</span>
-              </div>
-            </div>
-            <label class="field">
-              <span class="field-label">목표</span>
-              <input id="handoffGoal" class="input" type="text" placeholder="프로젝트 목표" disabled />
-            </label>
-            <label class="field">
-              <span class="field-label">테스트 결과</span>
-              <input id="handoffTestResult" class="input" type="text" placeholder="미실행 / 통과 / 실패" disabled />
-            </label>
-            <label class="field">
-              <span class="field-label">다음 작업</span>
-              <textarea id="handoffNextSteps" class="input textarea-sm" rows="2" placeholder="다음 작업 내용" disabled></textarea>
-            </label>
-            <div class="meta-box">
-              <span class="meta-label">최근 워커 보고</span>
-              <div id="handoffWorkerReport" class="meta-pre">-</div>
-            </div>
-            <div class="meta-box">
-              <span class="meta-label">최근 Codex 검토</span>
-              <div id="handoffCodexReview" class="meta-pre">-</div>
-            </div>
-          </div>
-        </div>
+        <section class="inspector-section inspector-section-last">
+          <button id="toggleHcomLogBtn" class="inspector-summary-row" type="button">
+            <span class="inspector-summary-left">
+              <span id="activityDot" class="status-dot dot-stopped"></span>
+              <span id="activitySummaryText">hcom 활동</span>
+            </span>
+            <span class="inspector-summary-right">
+              <span id="hcomLogCount" class="inspector-count">0</span>
+              <span id="hcomChevron" class="chevron-icon">▾</span>
+            </span>
+          </button>
+          <div id="hcomLogList" class="hcom-log-list hidden"></div>
+        </section>
       </aside>
     </div>
   </div>
+
+  <!-- Floating Custom Popover Portal (Effort Slider + Model / Permission / Target Menus) -->
+  <div id="popoverPortal" class="popover-portal hidden" role="dialog" aria-modal="false"></div>
 
   <!-- 프로젝트 등록 모달 -->
   <div id="registerModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-header">
         <h2>로컬 프로젝트 폴더 등록</h2>
-        <button class="icon-btn modal-close" data-close="registerModal" aria-label="닫기">×</button>
+        <button class="icon-btn-sm modal-close" data-close="registerModal" type="button" aria-label="닫기">×</button>
       </div>
       <div class="modal-body">
         <label class="field">
@@ -237,7 +274,7 @@
     <div class="modal-card">
       <div class="modal-header">
         <h2>Antigravity 워커 추가</h2>
-        <button class="icon-btn modal-close" data-close="addWorkerModal" aria-label="닫기">×</button>
+        <button class="icon-btn-sm modal-close" data-close="addWorkerModal" type="button" aria-label="닫기">×</button>
       </div>
       <div class="modal-body">
         <p class="modal-desc">대상 프로젝트: <strong id="addWorkerProjectLabel"></strong></p>
@@ -246,30 +283,22 @@
           <input id="addWorkerNameInput" class="input" type="text" placeholder="예: 백엔드 워커" />
         </label>
         <label class="field">
-          <span class="field-label">worktree 경로 (선택, 같은 Git 저장소)</span>
+          <span class="field-label">worktree 경로 (선택)</span>
           <div class="input-row">
             <input id="addWorkerCwdInput" class="input mono-text" type="text" placeholder="비워두면 프로젝트 기본 경로 사용" />
             <button id="browseWorkerCwdBtn" class="btn btn-outline btn-sm" type="button">폴더</button>
           </div>
         </label>
         <div class="field-grid-2">
-          <label class="field">
-            <span class="field-label">모델 (Antigravity agy)</span>
-            <select id="addWorkerModelSelect" class="input"></select>
-          </label>
-          <label class="field">
-            <span class="field-label">추론 속도</span>
-            <select id="addWorkerEffortSelect" class="input"></select>
-          </label>
+          <div class="field">
+            <span class="field-label">모델 · 추론</span>
+            <button id="addWorkerModelEffortBtn" class="picker-field-btn" type="button">기본 모델 · Default</button>
+          </div>
+          <div class="field">
+            <span class="field-label">권한 수준</span>
+            <button id="addWorkerPermBtn" class="picker-field-btn" type="button">자동 진행 ▾</button>
+          </div>
         </div>
-        <label class="field">
-          <span class="field-label">워커 권한 수준</span>
-          <select id="addWorkerPermissionSelect" class="input">
-            <option value="always-proceed">자동 진행 (등록 폴더 신뢰 · 권장)</option>
-            <option value="ask">매번 승인 (중요 실행 시 앱에서 승인)</option>
-            <option value="read-only">읽기 전용 (계획·분석 전용)</option>
-          </select>
-        </label>
         <div id="addWorkerError" class="error-text hidden"></div>
       </div>
       <div class="modal-footer">
@@ -279,25 +308,44 @@
     </div>
   </div>
 
+  <!-- 사용자 지침 모달 (좌측 레일에서 선택적으로 열기) -->
+  <div id="instructionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>사용자 지침 (선택)</h2>
+        <button class="icon-btn-sm modal-close" data-close="instructionsModal" type="button" aria-label="닫기">×</button>
+      </div>
+      <div class="modal-body">
+        <textarea
+          id="customInstructionsInput"
+          class="input textarea-md"
+          rows="5"
+          placeholder="원하는 작업 방식·검수 기준을 자유롭게 적어두면 다음 Codex 요청부터 반영됩니다. 비워두면 추가 토큰을 사용하지 않습니다."
+        ></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline btn-sm modal-close" data-close="instructionsModal" type="button">닫기</button>
+        <button id="saveInstructionsBtn" class="btn btn-primary btn-sm" type="button">저장</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 업데이트 모달 -->
   <div id="updateModal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-header">
-        <h2>hcom_gui 설치형 업데이트</h2>
-        <button class="icon-btn modal-close" data-close="updateModal" aria-label="닫기">×</button>
+        <h2>hcom_gui 업데이트</h2>
+        <button class="icon-btn-sm modal-close" data-close="updateModal" type="button" aria-label="닫기">×</button>
       </div>
       <div class="modal-body">
         <div class="meta-box">
-          <span class="meta-label">현재 설치 버전</span>
+          <span class="meta-label">현재 버전</span>
           <span id="updateCurrentVersion" class="meta-value mono-text">1.0.0</span>
         </div>
         <div class="meta-box">
-          <span class="meta-label">보존되는 사용자 데이터 경로</span>
+          <span class="meta-label">사용자 데이터 경로</span>
           <span id="updateDataDir" class="meta-value mono-text">-</span>
         </div>
-        <p class="modal-desc">
-          최신 <code>hcom_gui-*-x64-setup.exe</code> 설치 파일을 실행하면 현재 실행 중인 앱을 정리하고 제자리에서 업데이트합니다. 등록한 프로젝트, <code>HCOM_DIR</code>, 대화 ID와 인계 기록은 그대로 유지됩니다.
-        </p>
         <div id="updateError" class="error-text hidden"></div>
       </div>
       <div class="modal-footer">
@@ -312,7 +360,7 @@
     <div class="modal-card">
       <div class="modal-header">
         <h2>로컬 CLI 연결 상태</h2>
-        <button class="icon-btn modal-close" data-close="diagnosticsModal" aria-label="닫기">×</button>
+        <button class="icon-btn-sm modal-close" data-close="diagnosticsModal" type="button" aria-label="닫기">×</button>
       </div>
       <div class="modal-body">
         <div id="diagnosticsDetail" class="diag-detail"></div>
